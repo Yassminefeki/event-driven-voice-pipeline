@@ -9,7 +9,7 @@ logging.basicConfig(
 
 # Configuration Bot & Serveurs
 TOKEN = "8521480703:AAHvL1pFiasxnNak26DFf_JjBDPso7nQjHg"
-WHISPER_ENDPOINT = "http://10.110.8.21:8000/v1/audio/transcriptions"
+WHISPER_ENDPOINT = "http://10.110.150.77/v1/audio/transcriptions"
 
 # Configuration MinIO
 MINIO_URL = "localhost:9000"

@@ -18,11 +18,12 @@ class MinioService:
         else:
             print(f"Bucket '{BUCKET_NAME}' déjà existant.")
 
-    def upload_audio(self, file_path: str) -> str:
+    def upload_audio(self, file_path: str, object_name: str | None = None) -> str:
         """Téléverse le fichier et renvoie l'URL d'accès."""
+        object_name = object_name or file_path
         self.client.fput_object(
             BUCKET_NAME,
-            file_path,
+            object_name,
             file_path,
             content_type="audio/wav"
         )

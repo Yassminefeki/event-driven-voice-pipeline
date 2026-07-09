@@ -11,7 +11,7 @@ class WhisperService:
                 WHISPER_ENDPOINT,
                 files={"file": ("audio.wav", audio, "audio/wav")},
                 data={"language": "ar"},
-                timeout=20
+                timeout=60
             )
         
         print("Réponse serveur Whisper (initial) :", response.text)
