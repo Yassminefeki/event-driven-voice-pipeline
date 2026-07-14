@@ -14,5 +14,5 @@ class ElasticService:
             "wer": wer,
             "cer": cer
         }
-        self.es.index(index=INDEX_NAME, document=document)
+        self.es.index(index=INDEX_NAME, body=document)
         print("✅ Données enregistrées dans ELK.")

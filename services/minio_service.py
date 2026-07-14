@@ -3,6 +3,7 @@ from config.settings import MINIO_URL, MINIO_ACCESS_KEY, MINIO_SECRET_KEY, MINIO
 
 class MinioService:
     def __init__(self):
+        self.bucket_name = BUCKET_NAME
         self.client = Minio(
             MINIO_URL,
             access_key=MINIO_ACCESS_KEY,
@@ -22,9 +23,14 @@ class MinioService:
         """Téléverse le fichier et renvoie l'URL d'accès."""
         object_name = object_name or file_path
         self.client.fput_object(
-            BUCKET_NAME,
+            self.bucket_name,
             object_name,
             file_path,
             content_type="audio/wav"
         )
-        return f"http://{MINIO_URL}/{BUCKET_NAME}/{file_path}"
+        return f"http://{MINIO_URL}/{self.bucket_name}/{object_name}"
+
+    def download_audio(self, object_name: str, destination_path: str) -> str:
+        """Télécharge un objet MinIO vers un chemin local."""
+        self.client.fget_object(self.bucket_name, object_name, destination_path)
+        return destination_path

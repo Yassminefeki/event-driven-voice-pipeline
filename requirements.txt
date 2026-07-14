@@ -1,0 +1,5 @@
+python-telegram-bot>=21.0
+requests>=2.31
+minio>=7.0
+elasticsearch>=8.0
+kafka-python>=2.0

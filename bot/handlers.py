@@ -7,11 +7,13 @@ from bot.memory import last_transcription
 from services.minio_service import MinioService
 from services.whisper_service import WhisperService
 from services.elastic_service import ElasticService
+from services.kafka_service import KafkaService, build_audio_uploaded_message, build_transcription_completed_message
 from utils.metrics import calculate_metrics
 
 # Initialisation des services requis par les handlers
 minio_service = MinioService()
 elastic_service = ElasticService()
+kafka_service = KafkaService()
 
 async def receive_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -31,8 +33,16 @@ async def receive_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await file.download_to_drive(file_name)
 
     try:
-        # Téléversement vers MinIO & API Whisper
-        audio_url = minio_service.upload_audio(file_name)
+        object_name = f"{audio_id}.wav"
+        audio_url = minio_service.upload_audio(file_name, object_name=object_name)
+        payload = build_audio_uploaded_message(
+            audio_id=audio_id,
+            user_id=str(user_id),
+            bucket=minio_service.bucket_name,
+            object_name=object_name,
+            filename=file_name,
+        )
+        kafka_service.publish(payload["topic"], payload, key=str(user_id))
         transcription = WhisperService.transcribe(file_name)
     finally:
         if os.path.exists(file_name):
@@ -42,7 +52,8 @@ async def receive_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_transcription[user_id] = {
         "audio_initial": audio_url,
         "transcription_initiale": transcription,
-        "awaiting_correction": False
+        "awaiting_correction": False,
+        "audio_id": audio_id,
     }
 
     keyboard = [
@@ -79,6 +90,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             correction=data["transcription_initiale"],
             wer=0.0,
             cer=0.0
+        )
+        kafka_service.publish(
+            "transcription.completed",
+            build_transcription_completed_message(
+                audio_id=data.get("audio_id", "unknown"),
+                user_id=str(user_id),
+                text=data["transcription_initiale"],
+                bucket=minio_service.bucket_name,
+                object_name=data.get("audio_id", "unknown") + ".wav",
+            ),
+            key=str(user_id),
         )
         last_transcription.pop(user_id, None)
         await query.edit_message_text("✅ Transcription enregistrée sans modification.")
@@ -133,6 +155,17 @@ async def receive_correction_input(update: Update, context: ContextTypes.DEFAULT
         correction=correction_text,
         wer=wer,
         cer=cer
+    )
+    kafka_service.publish(
+        "transcription.completed",
+        build_transcription_completed_message(
+            audio_id=data.get("audio_id", "unknown"),
+            user_id=str(user_id),
+            text=correction_text,
+            bucket=minio_service.bucket_name,
+            object_name=data.get("audio_id", "unknown") + ".wav",
+        ),
+        key=str(user_id),
     )
     
     last_transcription.pop(user_id, None)
