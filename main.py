@@ -2,6 +2,7 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, CallbackQueryHandler, filters
 
 from config.settings import TOKEN
+from bot.asr_consumer import consume_asr_results
 from bot.handlers import receive_voice, button_handler, receive_correction_input
 
 def main():
@@ -12,6 +13,9 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.VOICE, receive_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_correction_input))
+
+    # Démarre le consommateur ASR en tâche de fond
+    app.create_task(consume_asr_results(app))
 
     print("Bot démarré...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

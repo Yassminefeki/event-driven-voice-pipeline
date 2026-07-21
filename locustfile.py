@@ -65,3 +65,4 @@ class LocalArchitectureStressTest(User):
 
         except Exception as e:
             print(f"💥 Le pipeline a planté : {e}")
+#locust -f locustfile.py

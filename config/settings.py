@@ -40,4 +40,4 @@ BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME", "audio-archive")
 
 # Configuration Elasticsearch
 ELASTIC_URL = os.getenv("ELASTIC_URL", "http://10.110.188.120:9200")
-INDEX_NAME = os.getenv("ELASTIC_INDEX_NAME", "transcription.completed")
+INDEX_NAME = os.getenv("ELASTIC_INDEX_NAME", "transcription.evaluated")
