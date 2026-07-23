@@ -1,6 +1,7 @@
 import httpx
 import logging
-from config.settings import WHISPER_ENDPOINT
+from pathlib import Path
+from config.settings import WHISPER_API_KEY, WHISPER_ENDPOINT, WHISPER_LANGUAGE, WHISPER_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -11,15 +12,22 @@ class WhisperService:
         logger.info("Envoi du vocal initial au serveur Whisper...")
         
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            headers = {}
+            if WHISPER_API_KEY:
+                headers["Authorization"] = f"Bearer {WHISPER_API_KEY}"
+
+            async with httpx.AsyncClient(timeout=WHISPER_TIMEOUT) as client:
                 with open(file_path, "rb") as audio:
-                    files = {"file": ("audio.wav", audio, "audio/wav")}
-                    data = {"language": "ar"}
+                    suffix = Path(file_path).suffix.lower()
+                    content_type = "audio/ogg" if suffix == ".ogg" else "audio/wav"
+                    files = {"file": (f"audio{suffix or '.wav'}", audio, content_type)}
+                    data = {"language": WHISPER_LANGUAGE}
                     
                     response = await client.post(
                         WHISPER_ENDPOINT, 
                         files=files, 
-                        data=data
+                        data=data,
+                        headers=headers,
                     )
 
             logger.info(f"Réponse serveur Whisper: {response.status_code} - {response.text}")

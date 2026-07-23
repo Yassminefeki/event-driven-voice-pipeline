@@ -10,8 +10,8 @@ KAFKA_BOOTSTRAP_SERVERS = os.getenv(
 )
 
 AUDIO_RAW_TOPIC = "audio.uploaded"
-ASR_COMPLETED_TOPIC = "asr.completed"
-TRANSCRIPTION_EVALUATED_TOPIC = "transcription.evaluated"
+AUDIO_TRANSCRIBED_TOPIC = "audio.transcribed"
+TRANSCRIPTION_CORRECTED_TOPIC = "transcription.corrected"
 
 
 class KafkaService:
@@ -38,19 +38,20 @@ class KafkaService:
         )
         self.producer.flush()
 
-    def publish_audio(self, audio_bytes, object_name, message_id, user_id, filename):
+    def publish_audio(self, audio_bytes, object_name, message_id, user_id, bucket):
         """
         Publie l'audio brut sur AUDIO_RAW_TOPIC.
 
-        - value  : octets bruts du fichier .wav.
+        - value  : octets bruts du fichier audio.
         - key    : message_id pour garantir le partitionnement Kafka par message.
         - headers: métadonnées nécessaires à la consommation et à la corrélation.
         """
         headers = [
             ("message_id", str(message_id).encode("utf-8")),
             ("user_id", str(user_id).encode("utf-8")),
-            ("filename", filename.encode("utf-8")),
+            ("bucket", bucket.encode("utf-8")),
             ("object_name", object_name.encode("utf-8")),
+            ("content_type", b"audio/ogg"),
         ]
         self.producer.send(
             AUDIO_RAW_TOPIC,
@@ -65,18 +66,7 @@ class KafkaService:
 # Message builders pour les événements Kafka
 # ==================================================
 
-def build_audio_uploaded_message(message_id, user_id, bucket, object_name, filename):
-    return {
-        "topic": AUDIO_RAW_TOPIC,
-        "message_id": message_id,
-        "user_id": user_id,
-        "bucket": bucket,
-        "object_name": object_name,
-        "filename": filename,
-    }
-
-
-def build_asr_completed_message(message_id, user_id, audio_url, transcription_initiale):
+def build_audio_transcribed_message(message_id, user_id, audio_url, transcription_initiale):
     return {
         "message_id": message_id,
         "user_id": user_id,
@@ -85,7 +75,7 @@ def build_asr_completed_message(message_id, user_id, audio_url, transcription_in
     }
 
 
-def build_transcription_evaluated_message(
+def build_transcription_corrected_message(
     message_id,
     user_id,
     audio_url,
@@ -100,7 +90,7 @@ def build_transcription_evaluated_message(
         "user_id": user_id,
         "audio_url": audio_url,
         "transcription_initiale": transcription_initiale,
-        "correction": correction,
+        "transcription_corrigee": correction,
         "wer": float(wer),
         "cer": float(cer),
         "status": status,

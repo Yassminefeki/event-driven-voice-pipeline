@@ -28,17 +28,22 @@ def load_env_file() -> None:
 load_env_file()
 
 # Configuration Bot & Serveurs
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8521480703:AAHvL1pFiasxnNak26DFf_JjBDPso7nQjHg")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 WHISPER_ENDPOINT = os.getenv("WHISPER_ENDPOINT", "http://10.110.150.77/v1/audio/transcriptions")
+WHISPER_API_KEY = os.getenv("WHISPER_API_KEY", "")
+WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "ar")
+WHISPER_TIMEOUT = float(os.getenv("WHISPER_TIMEOUT", "60"))
 
 
 # Configuration Elasticsearch
 ELASTIC_URL = os.getenv("ELASTIC_URL", "http://10.110.188.120:9200")
-INDEX_NAME = os.getenv("ELASTIC_INDEX_NAME", "transcription.evaluated")
+INDEX_NAME = os.getenv("ELASTIC_INDEX_NAME", "transcription.corrected")
+ELASTIC_USERNAME = os.getenv("ELASTIC_USERNAME", "")
+ELASTIC_PASSWORD = os.getenv("ELASTIC_PASSWORD", "")
 # --- Configuration MinIO & Stockage ---
-BUCKET_NAME = "audio-archive"
-MINIO_URL = "10.110.188.120:9000"       # Ou l'URL complète selon ton usage (ex: http://10.110.188.120:9000)
-MINIO_ENDPOINT = "10.110.188.120:9000"
-MINIO_ACCESS_KEY = "admin"
-MINIO_SECRET_KEY = "admin12345"
-MINIO_SECURE = False
+BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME", "audio-archive")
+MINIO_URL = os.getenv("MINIO_URL", "10.110.188.120:9000")
+MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", MINIO_URL)
+MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "")
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "")
+MINIO_SECURE = os.getenv("MINIO_SECURE", "false").lower() == "true"

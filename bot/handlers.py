@@ -1,7 +1,5 @@
 import os
-import base64
 import logging
-import requests
 from telegram import Update
 from telegram.ext import ContextTypes
 
@@ -12,10 +10,11 @@ try:
 except ImportError:
     HAS_JIWER = False
 
-from config.settings import BUCKET_NAME, ELASTIC_URL, INDEX_NAME
+from config.settings import BUCKET_NAME
 from config.settings import MINIO_ENDPOINT, MINIO_SECURE
 
 from services.kafka_service import KafkaService
+from services.kafka_service import TRANSCRIPTION_CORRECTED_TOPIC
 from bot.memory import last_transcription
 
 logger = logging.getLogger(__name__)
@@ -55,19 +54,21 @@ def calculate_wer_cer(reference: str, hypothesis: str):
     return round(wer, 4), round(cer, 4)
 
 
-def send_to_elasticsearch(doc_id: str, payload: dict) -> None:
-    """Envoie uniquement les champs demandés à Elasticsearch (ELK)."""
-    try:
-        url = f"{ELASTIC_URL}/{INDEX_NAME}/_doc/{doc_id}"
-        headers = {"Content-Type": "application/json"}
-        response = requests.put(url, json=payload, headers=headers, timeout=5)
-        
-        if response.status_code in (200, 201):
-            logger.info(f"📊 Données envoyées avec succès à Elasticsearch pour ID={doc_id}")
-        else:
-            logger.error(f"❌ Erreur indexation Elasticsearch [{response.status_code}]: {response.text}")
-    except Exception as e:
-        logger.error(f"❌ Exception lors de l'envoi vers Elasticsearch: {e}")
+def publish_correction(message_id: str, status: str, text_initial: str,
+                       corrected_text: str, audio_url: str, user_id: str) -> None:
+    """Publie la décision utilisateur; Elasticsearch est alimenté par Kafka Connect."""
+    wer, cer = calculate_wer_cer(text_initial, corrected_text)
+    payload = {
+        "message_id": message_id,
+        "user_id": user_id,
+        "audio_url": audio_url,
+        "transcription_initiale": text_initial,
+        "transcription_corrigee": corrected_text,
+        "wer": 0.0 if status == "kept" else wer,
+        "cer": 0.0 if status == "kept" else cer,
+        "status": status,
+    }
+    kafka_service.publish(TRANSCRIPTION_CORRECTED_TOPIC, payload, key=message_id)
 
 
 async def receive_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -99,23 +100,18 @@ async def receive_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await file.download_to_drive(file_name)
 
     try:
-        # 2. Lecture et encodage Base64 de l'audio
+        # Le message Kafka contient les octets; le MinIO Sink Connector les écrit.
         with open(file_name, "rb") as f:
             audio_bytes = f.read()
-        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
 
-        # 3. Publication directe dans Kafka (audio.uploaded)
-        payload = {
-            "message_id": message_id,
-            "user_id": user_id,
-            "bucket": BUCKET_NAME,
-            "object_name": object_name,
-            "file_content": audio_b64,
-            "audio_url": audio_http_url,
-        }
-
-        kafka_service.publish("audio.uploaded", payload, key=message_id)
-        logger.info(f"✅ Audio (Base64) et métadonnées publiés sur Kafka pour message_id={message_id}")
+        kafka_service.publish_audio(
+            audio_bytes=audio_bytes,
+            object_name=object_name,
+            message_id=message_id,
+            user_id=user_id,
+            bucket=BUCKET_NAME,
+        )
+        logger.info(f"✅ Audio binaire publié sur Kafka pour message_id={message_id}")
 
         await update.message.reply_text("⏳ Vocal reçu ! Traitement de la transcription en cours...")
 
@@ -140,19 +136,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     action, message_id = data.split(":", 1)
 
     if action == "keep":
-        # Validation : Indexation directe avec WER/CER = 0.0
+        # La validation est publiée; Elasticsearch est alimenté par son Sink Connector.
         if message_id in last_transcription:
             text_initial = last_transcription[message_id].get("transcription_initiale", "")
             audio_url = last_transcription[message_id].get("audio_url", "")
-            
-            doc_data = {
-                "audio_url": audio_url,
-                "transcription_initiale": text_initial,
-                "transcription_corrigee": text_initial,
-                "wer": 0.0,
-                "cer": 0.0
-            }
-            send_to_elasticsearch(message_id, doc_data)
+            user_id = last_transcription[message_id].get("user_id", "")
+            publish_correction(message_id, "kept", text_initial, text_initial, audio_url, user_id)
 
             await query.edit_message_text(
                 f"✅ **Transcription validée et enregistrée !**\n\n{text_initial}",
@@ -180,7 +169,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def receive_correction_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Récupère la correction texte, calcule WER/CER et indexe dans Elasticsearch."""
+    """Récupère la correction texte et la publie sur Kafka."""
     message_id = context.user_data.get("awaiting_correction_for")
     if not message_id:
         return
@@ -191,16 +180,10 @@ async def receive_correction_input(update: Update, context: ContextTypes.DEFAULT
         text_initial = last_transcription[message_id].get("transcription_initiale", "")
         audio_url = last_transcription[message_id].get("audio_url", "")
 
-        wer, cer = calculate_wer_cer(reference=text_initial, hypothesis=corrected_text)
-
-        doc_data = {
-            "audio_url": audio_url,
-            "transcription_initiale": text_initial,
-            "transcription_corrigee": corrected_text,
-            "wer": wer,
-            "cer": cer
-        }
-        send_to_elasticsearch(message_id, doc_data)
+        user_id = last_transcription[message_id].get("user_id", "")
+        publish_correction(
+            message_id, "corrected", text_initial, corrected_text, audio_url, user_id
+        )
 
     del context.user_data["awaiting_correction_for"]
 
