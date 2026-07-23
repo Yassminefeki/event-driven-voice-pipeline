@@ -1,98 +1,130 @@
-import json
 import os
-import tempfile
-
+import base64
+import json
+import logging
+import subprocess
 from kafka import KafkaConsumer
+from minio import Minio
+import whisper
 
-from services.kafka_service import (
-    KAFKA_BOOTSTRAP_SERVERS,
-    KafkaService,
-    ASR_COMPLETED_TOPIC,
-    build_asr_completed_message,
+from config.settings import (
+    BUCKET_NAME,
+    MINIO_ENDPOINT,
+    MINIO_ACCESS_KEY,
+    MINIO_SECRET_KEY,
+    MINIO_SECURE,
 )
-from services.minio_service import MinioService
-from services.whisper_service import WhisperService
+from services.kafka_service import (
+    KafkaService,
+    KAFKA_BOOTSTRAP_SERVERS,
+    ASR_COMPLETED_TOPIC,
+)
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+minio_client = Minio(
+    MINIO_ENDPOINT,
+    access_key=MINIO_ACCESS_KEY,
+    secret_key=MINIO_SECRET_KEY,
+    secure=MINIO_SECURE,
+)
+
+kafka_service = KafkaService()
+
+logger.info("⏳ Chargement du modèle Whisper...")
+model = whisper.load_model("base")
+logger.info("✅ Modèle Whisper chargé avec succès.")
 
 
-def main() -> None:
+def ensure_bucket_exists():
+    try:
+        if not minio_client.bucket_exists(BUCKET_NAME):
+            minio_client.make_bucket(BUCKET_NAME)
+    except Exception as e:
+        logger.error(f"❌ Erreur MinIO: {e}")
+
+
+def main():
+    ensure_bucket_exists()
+    bootstrap_list = [s.strip() for s in KAFKA_BOOTSTRAP_SERVERS.split(",") if s.strip()]
+
     consumer = KafkaConsumer(
         "audio.uploaded",
-        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS.split(","),
+        bootstrap_servers=bootstrap_list,
         group_id="whisper-worker-group",
-        auto_offset_reset="earliest",
+        auto_offset_reset="latest",
         enable_auto_commit=True,
     )
 
-    kafka_service = KafkaService()
-    minio_service = MinioService()
-    whisper_service = WhisperService()
-
-    print("🎧 Whisper worker running...")
+    logger.info(">>> [Whisper Worker] En écoute sur le topic 'audio.uploaded'...")
 
     for message in consumer:
+        temp_raw_name = None
+        temp_wav_name = None
         try:
-            data = {}
-            if message.value:
-                try:
-                    data = json.loads(message.value.decode("utf-8"))
-                except (json.JSONDecodeError, AttributeError):
-                    data = {}
+            data = json.loads(message.value.decode("utf-8"))
+            message_id = data.get("message_id")
+            user_id = data.get("user_id")
+            
+            # Forcer l'extension .wav pour correspondre au fichier converti
+            orig_object_name = data.get("object_name", f"{message_id}.ogg")
+            base_name, _ = os.path.splitext(orig_object_name)
+            object_name = f"{base_name}.wav"
 
-            headers = {
-                name: value.decode("utf-8") if isinstance(value, bytes) else value
-                for name, value in (message.headers or [])
+            file_content_b64 = data.get("file_content")
+            if not file_content_b64:
+                continue
+
+            # 1. Sauvegarde brute temporaire
+            audio_bytes = base64.b64decode(file_content_b64)
+            temp_raw_name = f"temp_raw_{message_id}.ogg"
+            with open(temp_raw_name, "wb") as f:
+                f.write(audio_bytes)
+
+            # 2. Conversion en WAV 16kHz mono via FFmpeg
+            temp_wav_name = f"temp_conv_{message_id}.wav"
+            cmd = [
+                "ffmpeg", "-y", "-i", temp_raw_name,
+                "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+                temp_wav_name
+            ]
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+
+            # 3. Upload vers MinIO au format .wav
+            minio_client.fput_object(
+                bucket_name=BUCKET_NAME,
+                object_name=object_name,
+                file_path=temp_wav_name,
+                content_type="audio/wav",
+            )
+
+            # 4. Transcription Whisper
+            result = model.transcribe(temp_wav_name)
+            transcription = result.get("text", "").strip()
+
+            # 5. Publication du résultat
+            payload = {
+                "message_id": message_id,
+                "user_id": user_id,
+                "transcription_initiale": transcription,
             }
-
-            message_id = str(
-                data.get("message_id")
-                or headers.get("message_id")
-                or (message.key.decode("utf-8") if message.key else "")
-            )
-            user_id = str(data.get("user_id") or headers.get("user_id") or "")
-            bucket = data.get("bucket") or headers.get("bucket")
-            object_name = data.get("object_name") or headers.get("object_name")
-
-            if not message_id or not user_id:
-                raise ValueError("Missing required message_id or user_id")
-
-            print(f"📩 Message Kafka reçu : message_id={message_id}")
-
-            if bucket and object_name:
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    local_path = tmp.name
-
-                minio_service.client.fget_object(bucket, object_name, local_path)
-                audio_url = f"http://{minio_service.client._base_url.host}/{bucket}/{object_name}"
-            else:
-                if not message.value:
-                    raise ValueError("Missing audio payload and MinIO metadata")
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                    local_path = tmp.name
-                with open(local_path, "wb") as audio_file:
-                    audio_file.write(message.value)
-                audio_url = data.get("audio_url", "")
-
-            transcription = whisper_service.transcribe(local_path)
-            os.remove(local_path)
-
-            asr_message = build_asr_completed_message(
-                message_id=message_id,
-                user_id=user_id,
-                audio_url=audio_url,
-                transcription_initiale=transcription,
-            )
-
-            kafka_service.publish(
-                ASR_COMPLETED_TOPIC,
-                asr_message,
-                key=message_id,
-            )
-            print(f"✅ Published ASR result for message_id: {message_id}")
+            kafka_service.publish(ASR_COMPLETED_TOPIC, payload, key=message_id)
+            logger.info(f"✅ Traité avec succès pour message_id={message_id}")
 
         except Exception as e:
-            print(f"❌ Worker Error: {e}")
-            continue
+            logger.error(f"❌ Erreur: {e}")
+
+        finally:
+            if temp_raw_name and os.path.exists(temp_raw_name):
+                os.remove(temp_raw_name)
+            if temp_wav_name and os.path.exists(temp_wav_name):
+                os.remove(temp_wav_name)
 
 
 if __name__ == "__main__":
     main()
+
