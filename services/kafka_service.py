@@ -66,14 +66,14 @@ class KafkaService:
 # Message builders pour les événements Kafka
 # ==================================================
 
-def build_audio_transcribed_message(message_id, user_id, audio_url, transcription_initiale):
+def build_audio_transcribed_message(message_id, user_id, audio_url, transcription_initiale, object_name=None):
     return {
         "message_id": message_id,
         "user_id": user_id,
         "audio_url": audio_url,
+        "object_name": object_name,
         "transcription_initiale": transcription_initiale,
     }
-
 
 def build_transcription_corrected_message(
     message_id,
