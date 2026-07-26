@@ -1,22 +1,13 @@
 {
-  "name": "minio-audio-sink",
+  "name": "minio-s3-sink-connector",
   "config": {
     "connector.class": "io.confluent.connect.s3.S3SinkConnector",
     "tasks.max": "1",
     "topics": "audio.uploaded",
-    "s3.bucket.name": "${env:MINIO_BUCKET_NAME}",
+    "s3.bucket.name": "audio-archive",
     "s3.region": "us-east-1",
-    "store.url": "http://${env:MINIO_ENDPOINT}",
-    "aws.access.key.id": "${env:MINIO_ACCESS_KEY}",
-    "aws.secret.access.key": "${env:MINIO_SECRET_KEY}",
-    "storage.class": "io.confluent.connect.s3.storage.S3Storage",
-    "format.class": "io.confluent.connect.s3.format.bytearray.ByteArrayFormat",
-    "value.converter": "org.apache.kafka.connect.converters.ByteArrayConverter",
-    "key.converter": "org.apache.kafka.connect.storage.StringConverter",
-    "partitioner.class": "io.confluent.connect.storage.partitioner.DefaultPartitioner",
-    "flush.size": "1",
-    "s3.compression.type": "none",
-    "s3.path.style.access": "true",
-    "s3.ssl.enabled": "false"
+    "store.url": "http://minio:9000",
+    "format.class": "io.confluent.connect.s3.format.json.JsonFormat",
+    "flush.size": "1"
   }
 }
