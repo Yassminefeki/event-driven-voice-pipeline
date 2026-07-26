@@ -1,16 +1,19 @@
 import asyncio
 import json
+import logging
 from kafka import KafkaConsumer
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application
 
 from bot.memory import last_transcription
-from services.kafka_service import AUDIO_TRANSCRIBED_TOPIC, KAFKA_BOOTSTRAP_SERVERS
+from config.settings import AUDIO_TRANSCRIBED_TOPIC, KAFKA_BOOTSTRAP_SERVERS
+
+logger = logging.getLogger(__name__)
 
 
 def _consume_loop(app: Application, loop: asyncio.AbstractEventLoop) -> None:
-    print(">>> [Kafka Consumer] Initialisation de la connexion Kafka...")
+    logger.info(">>> [Kafka Consumer] Initializing Kafka connection...")
     
     bootstrap_list = [s.strip() for s in KAFKA_BOOTSTRAP_SERVERS.split(",") if s.strip()]
     
@@ -18,19 +21,18 @@ def _consume_loop(app: Application, loop: asyncio.AbstractEventLoop) -> None:
         AUDIO_TRANSCRIBED_TOPIC,
         bootstrap_servers=bootstrap_list,
         group_id="bot-asr-consumer-group",
-        auto_offset_reset="latest",  # Prend les nouveaux messages immédiatement
+        auto_offset_reset="latest",
         enable_auto_commit=True,
         value_deserializer=lambda v: json.loads(v.decode("utf-8")) if v else {},
     )
 
-    print(f">>> [Kafka Consumer] En écoute sur le topic '{AUDIO_TRANSCRIBED_TOPIC}'...")
+    logger.info(f">>> [Kafka Consumer] Listening on topic '{AUDIO_TRANSCRIBED_TOPIC}'...")
 
     for message in consumer:
         try:
             data = message.value or {}
-            print(f"📥 [Kafka Message Reçu] Payload: {data}")
+            logger.info(f"📥 [Kafka Message Received] Payload: {data}")
 
-            # Récupération souple des clés (supporte plusieurs formats de JSON)
             message_id = str(
                 data.get("message_id") 
                 or data.get("id") 
@@ -39,19 +41,20 @@ def _consume_loop(app: Application, loop: asyncio.AbstractEventLoop) -> None:
             user_id = str(data.get("user_id") or data.get("chat_id") or "")
             audio_url = data.get("audio_url", "")
             
-            # Récupère la transcription (transcription_initiale ou text ou transcript)
             transcription_initiale = (
                 data.get("transcription_initiale") 
                 if data.get("transcription_initiale") is not None 
                 else data.get("text") or data.get("transcript")
             )
 
-            # Vérification de sécurité
             if not user_id or transcription_initiale is None:
-                print(f"❌ [Kafka Consumer] Message ignoré (champs manquants) -> user_id: '{user_id}', transcription: '{transcription_initiale}'")
+                logger.warning(
+                    f"❌ [Kafka Consumer] Ignored message (missing required fields) -> "
+                    f"user_id: '{user_id}', transcription: '{transcription_initiale}'"
+                )
                 continue
 
-            # Sauvegarde en mémoire
+            # Store state in memory for callback reference
             if message_id:
                 last_transcription[message_id] = {
                     "message_id": message_id,
@@ -68,7 +71,7 @@ def _consume_loop(app: Application, loop: asyncio.AbstractEventLoop) -> None:
                 ]
             ])
 
-            # Préparation de l'envoi vers Telegram via le thread principal
+            # Send message to Telegram UI thread
             coroutine = app.bot.send_message(
                 chat_id=int(user_id),
                 text=(
@@ -79,10 +82,10 @@ def _consume_loop(app: Application, loop: asyncio.AbstractEventLoop) -> None:
                 reply_markup=keyboard,
             )
             asyncio.run_coroutine_threadsafe(coroutine, loop)
-            print(f"✅ [Kafka Consumer] Message envoyé sur Telegram à l'utilisateur {user_id}")
+            logger.info(f"✅ [Kafka Consumer] Successfully sent message to Telegram user {user_id}")
 
         except Exception as exc:
-            print(f"❌ [Kafka Consumer Error] : {exc}")
+            logger.error(f"❌ [Kafka Consumer Error] : {exc}")
             continue
 
 

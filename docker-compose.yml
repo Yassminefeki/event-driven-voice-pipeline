@@ -1,0 +1,51 @@
+version: "3.8"
+
+services:
+  # ----------------------------------------------------
+  # Telegram Bot & Kafka ASR Consumer Service
+  # ----------------------------------------------------
+  telegram-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: telegram_asr_bot
+    restart: unless-stopped
+    command: python main.py
+    env_file:
+      - .env
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS:-kafka1:9092,kafka2:9092,kafka3:9092}
+      - AUDIO_RAW_TOPIC=${AUDIO_RAW_TOPIC:-audio.uploaded}
+      - AUDIO_TRANSCRIBED_TOPIC=${AUDIO_TRANSCRIBED_TOPIC:-audio.transcribed}
+      - TRANSCRIPTION_CORRECTED_TOPIC=${TRANSCRIPTION_CORRECTED_TOPIC:-transcription.corrected}
+      - ELASTIC_URL=${ELASTIC_URL:-http://10.110.188.120:9200}
+      - ELASTIC_INDEX_NAME=${ELASTIC_INDEX_NAME:-transcription.corrected}
+      - MINIO_BUCKET_NAME=${MINIO_BUCKET_NAME:-audio-archive}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT:-10.110.188.120:9000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ----------------------------------------------------
+  # Asynchronous Whisper Worker Service
+  # ----------------------------------------------------
+  whisper-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whisper_asr_worker
+    restart: unless-stopped
+    command: python whisper_worker.py
+    env_file:
+      - .env
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS:-kafka1:9092,kafka2:9092,kafka3:9092}
+      - AUDIO_RAW_TOPIC=${AUDIO_RAW_TOPIC:-audio.uploaded}
+      - AUDIO_TRANSCRIBED_TOPIC=${AUDIO_TRANSCRIBED_TOPIC:-audio.transcribed}
+      - WHISPER_ENDPOINT=${WHISPER_ENDPOINT:-http://10.110.150.77/v1/audio/transcriptions}
+      - WHISPER_API_KEY=${WHISPER_API_KEY}
+      - WHISPER_LANGUAGE=${WHISPER_LANGUAGE:-ar}
+      - MINIO_BUCKET_NAME=${MINIO_BUCKET_NAME:-audio-archive}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT:-10.110.188.120:9000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

@@ -16,7 +16,7 @@
     "partitioner.class": "io.confluent.connect.storage.partitioner.DefaultPartitioner",
     "flush.size": "1",
     "s3.compression.type": "none",
-    "s3.path.style.access.enabled": "true",
+    "s3.path.style.access": "true",
     "s3.ssl.enabled": "false"
   }
 }
