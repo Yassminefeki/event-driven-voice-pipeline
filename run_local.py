@@ -2,24 +2,40 @@
 
 import subprocess
 import time
-import signal
+import os
+import sys
 
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Existing virtual environment
+VENV_PYTHON = os.path.join(BASE_DIR, "venv", "bin", "python")
 
 processes = []
 
 
-def start_service(name, command):
+def start_service(name, script):
+
+    script_path = os.path.join(BASE_DIR, script)
 
     print(f"🚀 Starting {name}")
+    print(f"   Running: {script_path}")
 
-    process = subprocess.Popen(command)
+    if not os.path.exists(script_path):
+        print(f"❌ File not found: {script_path}")
+        sys.exit(1)
+
+    process = subprocess.Popen(
+        [VENV_PYTHON, script_path],
+        cwd=BASE_DIR
+    )
 
     processes.append(process)
 
 
 def stop_services():
 
-    print("\nStopping services...")
+    print("\n🛑 Stopping local services...")
 
     for process in processes:
         process.terminate()
@@ -27,33 +43,41 @@ def stop_services():
 
 def main():
 
+    if not os.path.exists(VENV_PYTHON):
+        print("❌ Virtual environment not found:")
+        print(VENV_PYTHON)
+        print("\nCreate it using:")
+        print("python3 -m venv venv")
+        sys.exit(1)
+
+
     try:
 
-        # Start Telegram bot
+        # Telegram Bot
         start_service(
             "Telegram Bot",
-            [
-                "python3",
-                "bot/BotTelegram.py"
-            ]
+            "main.py"
         )
 
 
         time.sleep(3)
 
 
-        # Start Whisper worker
+        # Whisper ASR Worker
         start_service(
             "Whisper Worker",
-            [
-                "python3",
-                "whisper-worker/worker.py"
-            ]
+            "asr_worker.py"
         )
 
 
         print("\n" + "=" * 60)
         print("✅ Local pipeline started")
+        print(f"🐍 Using venv: {VENV_PYTHON}")
+        print("")
+        print("Services:")
+        print("  - Telegram Bot")
+        print("  - Whisper ASR Worker")
+        print("")
         print("Press CTRL+C to stop")
         print("=" * 60)
 
