@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # In-memory session store: message_id -> last model transcription (for WER/CER diffing).
 # Swap for Redis/DB if the bot needs to survive restarts.
-_pending_transcriptions: dict[str, dict] = {}
+
 
 
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -46,7 +46,13 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         timestamp=timestamp,
     )
 
-    _pending_transcriptions[message_id] = {"chat_id": chat_id, "user_id": user_id}
+    pending_transcriptions = context.application.bot_data["pending_transcriptions"]
+
+    pending_transcriptions[message_id] = {
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "audio_url": audio_url,
+    }
     logger.info("message_id=%s uploaded, awaiting transcription", message_id)
 
 
@@ -57,7 +63,8 @@ async def handle_text_correction(update: Update, context: ContextTypes.DEFAULT_T
         return  # not a correction reply we're tracking
 
     message_id = context.bot_data["message_id_map"][reply_to.message_id]
-    session = _pending_transcriptions.get(message_id)
+    pending_transcriptions = context.application.bot_data["pending_transcriptions"]
+    session = pending_transcriptions.get(message_id)
     if not session:
         logger.warning("No pending session for message_id=%s, skipping correction", message_id)
         return
