@@ -34,6 +34,7 @@ class MinioService:
 
     def upload_audio(self, message_id: str, audio_bytes: bytes) -> str:
         key = self.object_key(message_id)
+
         self._client.put_object(
             settings.minio_bucket_name,
             key,
@@ -41,7 +42,8 @@ class MinioService:
             length=len(audio_bytes),
             content_type="audio/ogg",
         )
-        return f"s3://{settings.minio_bucket_name}/{key}"
+
+    return f"http://10.110.188.120:9000/{settings.minio_bucket_name}/{key}"
 
     def download_audio(self, message_id: str) -> bytes:
         key = self.object_key(message_id)
