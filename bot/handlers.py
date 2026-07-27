@@ -1,5 +1,5 @@
 # bot/handlers.py
-from services.kafka_service import send_kafka_event
+from services.kafka_client import send_kafka_event
 
 
 async def handle_voice_message(update, context):
