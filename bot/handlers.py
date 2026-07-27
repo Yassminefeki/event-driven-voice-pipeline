@@ -1,5 +1,7 @@
 # bot/handlers.py
+import base64
 from services.kafka_client import send_kafka_event
+from services.kafka_service import build_audio_uploaded_headers
 
 
 async def handle_voice_message(update, context):

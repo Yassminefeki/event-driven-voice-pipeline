@@ -1,25 +1,33 @@
 import logging
 
-from telegram.ext import ApplicationBuilder, CallbackQueryHandler, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, MessageHandler, filters
 
 from bot.asr_consumer import consume_asr_results
-from bot.handlers import button_handler, receive_correction_input, receive_voice
+from bot.handlers import handle_voice_message
 from config.settings import TOKEN
+
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
 logger = logging.getLogger(__name__)
 
 
 async def start_asr_consumer(application):
-    application.create_task(consume_asr_results(application))
+    application.create_task(
+        consume_asr_results(application)
+    )
 
 
 def main():
+
     if not TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN doit être défini dans .env")
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN doit être défini dans .env"
+        )
+
 
     application = (
         ApplicationBuilder()
@@ -27,13 +35,21 @@ def main():
         .post_init(start_asr_consumer)
         .build()
     )
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.VOICE, receive_voice))
+
+
+    # Receive Telegram voice messages
     application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, receive_correction_input)
+        MessageHandler(
+            filters.VOICE,
+            handle_voice_message
+        )
     )
 
-    logger.info("🤖 Bot Telegram démarré et en écoute...")
+
+    logger.info(
+        "🤖 Bot Telegram démarré et en écoute..."
+    )
+
     application.run_polling()
 
 
