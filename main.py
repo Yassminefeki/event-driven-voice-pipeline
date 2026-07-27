@@ -18,9 +18,19 @@ logger = logging.getLogger(__name__)
 
 async def _post_init(application) -> None:
     pending_transcriptions: dict = {}
+    message_id_map: dict = {}
+
     application.bot_data["pending_transcriptions"] = pending_transcriptions
-    application.bot_data.setdefault("message_id_map", {})
-    asyncio.create_task(run_asr_consumer_loop(application.bot, pending_transcriptions))
+    application.bot_data["message_id_map"] = message_id_map
+
+    asyncio.create_task(
+        run_asr_consumer_loop(
+            application.bot,
+            pending_transcriptions,
+            message_id_map,
+        )
+    )
+
     logger.info("audio.transcribed consumer loop started")
 
 
