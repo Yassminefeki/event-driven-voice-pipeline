@@ -43,7 +43,7 @@ class MinioService:
             content_type="audio/ogg",
         )
 
-    return f"http://10.110.188.120:9000/{settings.minio_bucket_name}/{key}"
+        return f"http://10.110.188.120:9000/{settings.minio_bucket_name}/{key}"
 
     def download_audio(self, message_id: str) -> bytes:
         key = self.object_key(message_id)
