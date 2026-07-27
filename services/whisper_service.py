@@ -1,44 +1,38 @@
+"""
+Whisper API client (step 7: ASR Worker -> API, step 8: API -> ASR Worker).
+"""
 import logging
-import httpx
-from config.settings import WHISPER_API_KEY, WHISPER_ENDPOINT, WHISPER_LANGUAGE, WHISPER_TIMEOUT
+import time
+
+import requests
+
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
 
 class WhisperService:
+    def __init__(self, timeout_seconds: int = 60):
+        self.timeout_seconds = timeout_seconds
 
-    @staticmethod
-    async def transcribe(file_path: str) -> str:
-        """Sends an audio file to the Whisper HTTP endpoint and returns the transcribed text."""
-        headers = {}
-        if WHISPER_API_KEY:
-            headers["Authorization"] = f"Bearer {WHISPER_API_KEY}"
+    def transcribe(self, audio_bytes: bytes, filename: str = "audio.ogg") -> dict:
+        """Returns {"text": ..., "processing_time_ms": ..., "model_version": ...}"""
+        start = time.monotonic()
+        response = requests.post(
+            settings.whisper_endpoint,
+            files={"file": (filename, audio_bytes)},
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        elapsed_ms = int((time.monotonic() - start) * 1000)
 
-        data = {
-            "language": WHISPER_LANGUAGE,
+        data = response.json()
+        return {
+            "text": data.get("text", ""),
+            "processing_time_ms": elapsed_ms,
+            "model_version": data.get("model", "whisper"),
+            "confidence_score": data.get("confidence", None),
         }
 
-        try:
-            async with httpx.AsyncClient(timeout=WHISPER_TIMEOUT) as client:
-                with open(file_path, "rb") as audio_file:
-                    files = {"file": (file_path, audio_file, "audio/ogg")}
-                    response = await client.post(
-                        WHISPER_ENDPOINT,
-                        headers=headers,
-                        data=data,
-                        files=files,
-                    )
 
-                if response.status_code == 200:
-                    result = response.json()
-                    # Handle common Whisper API response structures
-                    transcription = result.get("text") or result.get("transcription") or ""
-                    logger.info(f"✅ Transcription successful for {file_path}")
-                    return transcription.strip()
-                else:
-                    logger.error(f"❌ Whisper API error ({response.status_code}): {response.text}")
-                    return ""
-
-        except Exception as e:
-            logger.error(f"❌ Exception occurred during Whisper transcription: {e}")
-            return ""
+whisper_service = WhisperService()

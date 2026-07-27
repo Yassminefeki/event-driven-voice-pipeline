@@ -1,52 +1,44 @@
+"""
+Central environment configuration.
+All other modules import from here — never read os.environ directly elsewhere.
+"""
 import os
-import logging
-from pathlib import Path
+from dataclasses import dataclass
+from dotenv import load_dotenv
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+load_dotenv()
 
-def load_env_file() -> None:
-    env_path = Path(__file__).resolve().parents[1] / ".env"
-    if not env_path.exists():
-        return
 
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
+@dataclass(frozen=True)
+class Settings:
+    # --- Telegram ---
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"\'')
-        os.environ.setdefault(key, value)
+    # --- Kafka ---
+    kafka_bootstrap_servers: list[str] = tuple(
+        os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka1:9092,kafka2:9092,kafka3:9092").split(",")
+    )
+    kafka_group_id_bot: str = os.getenv("KAFKA_GROUP_ID_BOT", "telegram-bot-group")
+    kafka_group_id_worker: str = os.getenv("KAFKA_GROUP_ID_WORKER", "asr-worker-group")
 
-load_env_file()
+    # --- Kafka topics (STRICTLY matches the 15-step reference table) ---
+    topic_audio_uploaded: str = "audio.uploaded"
+    topic_audio_transcribed: str = "audio.transcribed"
+    topic_transcription_corrected: str = "transcription.corrected"
 
-# Telegram Bot & Whisper Server
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-WHISPER_ENDPOINT = os.getenv("WHISPER_ENDPOINT", "http://10.110.150.77/v1/audio/transcriptions")
-WHISPER_API_KEY = os.getenv("WHISPER_API_KEY", "")
-WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "ar")
-WHISPER_TIMEOUT = float(os.getenv("WHISPER_TIMEOUT", "60"))
+    # --- MinIO / S3 ---
+    minio_endpoint: str = os.getenv("MINIO_ENDPOINT", "")
+    minio_access_key: str = os.getenv("MINIO_ACCESS_KEY", "")
+    minio_secret_key: str = os.getenv("MINIO_SECRET_KEY", "")
+    minio_bucket_name: str = os.getenv("MINIO_BUCKET_NAME", "audio-archive")  # step 5
+    minio_secure: bool = os.getenv("MINIO_SECURE", "False").lower() == "true"
 
-# Kafka Configuration
-KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka1:9092,kafka2:9092,kafka3:9092")
-AUDIO_RAW_TOPIC = os.getenv("AUDIO_RAW_TOPIC", "audio.uploaded")
-TRANSCRIPTION_COMPLETED_TOPIC = os.getenv("TRANSCRIPTION_COMPLETED_TOPIC", "audio.transcribed")
-TRANSCRIPTION_CORRECTED_TOPIC = os.getenv("TRANSCRIPTION_CORRECTED_TOPIC", "transcription.corrected")
+    # --- Whisper ASR ---
+    whisper_endpoint: str = os.getenv("WHISPER_ENDPOINT", "")
 
-# Elasticsearch
-ELASTIC_URL = os.getenv("ELASTIC_URL", "http://10.110.188.120:9200")
-INDEX_NAME = os.getenv("ELASTIC_INDEX_NAME", "transcription.corrected")
-ELASTIC_USERNAME = os.getenv("ELASTIC_USERNAME", "")
-ELASTIC_PASSWORD = os.getenv("ELASTIC_PASSWORD", "")
+    # --- Elasticsearch ---
+    elastic_url: str = os.getenv("ELASTIC_URL", "")
+    elastic_index: str = os.getenv("ELASTIC_INDEX", "transcription.corrected")  # step 14
 
-# MinIO & Storage
-BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME", "audio-archive")
-MINIO_URL = os.getenv("MINIO_URL", "10.110.188.120:9000")
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", MINIO_URL)
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "")
-MINIO_SECURE = os.getenv("MINIO_SECURE", "false").lower() == "true"
+
+settings = Settings()

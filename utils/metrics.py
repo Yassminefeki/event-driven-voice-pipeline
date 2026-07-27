@@ -1,37 +1,36 @@
-import logging
-try:
-    import jiwer
-    HAS_JIWER = True
-except ImportError:
-    HAS_JIWER = False
-
-logger = logging.getLogger(__name__)
+"""
+Word Error Rate (WER) and Character Error Rate (CER), used when computing
+`transcription.corrected` payloads (step 12).
+"""
 
 
-def calculate_metrics(reference: str, hypothesis: str) -> tuple[float, float]:
-    """Calculates Word Error Rate (WER) and Character Error Rate (CER)."""
-    if not reference and not hypothesis:
-        return 0.0, 0.0
+def _levenshtein(seq_a: list, seq_b: list) -> int:
+    m, n = len(seq_a), len(seq_b)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            cost = 0 if seq_a[i - 1] == seq_b[j - 1] else 1
+            dp[i][j] = min(
+                dp[i - 1][j] + 1,      # deletion
+                dp[i][j - 1] + 1,      # insertion
+                dp[i - 1][j - 1] + cost,  # substitution
+            )
+    return dp[m][n]
 
+
+def compute_wer(reference: str, hypothesis: str) -> float:
+    ref_words = reference.split()
+    hyp_words = hypothesis.split()
+    if not ref_words:
+        return 0.0 if not hyp_words else 1.0
+    return _levenshtein(ref_words, hyp_words) / len(ref_words)
+
+
+def compute_cer(reference: str, hypothesis: str) -> float:
     if not reference:
-        return 1.0, 1.0
-
-    if HAS_JIWER:
-        try:
-            wer = jiwer.wer(reference, hypothesis)
-            cer = jiwer.cer(reference, hypothesis)
-            return round(float(wer), 4), round(float(cer), 4)
-        except Exception as e:
-            logger.error(f"⚠️ Error in Jiwer calculation: {e}")
-            return -1.0, -1.0
-    else:
-        # Fallback simple metric when jiwer is unavailable
-        ref_words = reference.split()
-        hyp_words = hypothesis.split()
-        wer = 0.0 if ref_words == hyp_words else 1.0
-
-        ref_chars = list(reference)
-        hyp_chars = list(hypothesis)
-        cer = 0.0 if ref_chars == hyp_chars else 1.0
-
-        return round(wer, 4), round(cer, 4)
+        return 0.0 if not hypothesis else 1.0
+    return _levenshtein(list(reference), list(hypothesis)) / len(reference)

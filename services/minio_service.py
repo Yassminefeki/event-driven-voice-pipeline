@@ -1,58 +1,62 @@
-import io
+"""
+MinIO / S3 client.
+Uses a deterministic object key `{message_id}.ogg` so audio can always be
+located from the Kafka key alone — no separate lookup table required.
+"""
 import logging
+from io import BytesIO
+
 from minio import Minio
-from config.settings import (
-    BUCKET_NAME,
-    MINIO_ACCESS_KEY,
-    MINIO_ENDPOINT,
-    MINIO_SECRET_KEY,
-    MINIO_SECURE,
-)
+from minio.error import S3Error
+
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
 
 class MinioService:
-
     def __init__(self):
-        clean_endpoint = MINIO_ENDPOINT.replace("http://", "").replace("https://", "")
-        self.client = Minio(
-            endpoint=clean_endpoint,
-            access_key=MINIO_ACCESS_KEY,
-            secret_key=MINIO_SECRET_KEY,
-            secure=MINIO_SECURE,
+        self._client = Minio(
+            settings.minio_endpoint,
+            access_key=settings.minio_access_key,
+            secret_key=settings.minio_secret_key,
+            secure=settings.minio_secure,
         )
-        self._ensure_bucket_exists()
+        self._ensure_bucket()
 
-    def _ensure_bucket_exists(self):
+    def _ensure_bucket(self) -> None:
+        if not self._client.bucket_exists(settings.minio_bucket_name):
+            self._client.make_bucket(settings.minio_bucket_name)
+            logger.info("Created bucket %s", settings.minio_bucket_name)
+
+    def object_key(self, message_id: str) -> str:
+        return f"{message_id}.ogg"
+
+    def upload_audio(self, message_id: str, audio_bytes: bytes) -> str:
+        key = self.object_key(message_id)
+        self._client.put_object(
+            settings.minio_bucket_name,
+            key,
+            BytesIO(audio_bytes),
+            length=len(audio_bytes),
+            content_type="audio/ogg",
+        )
+        return f"s3://{settings.minio_bucket_name}/{key}"
+
+    def download_audio(self, message_id: str) -> bytes:
+        key = self.object_key(message_id)
         try:
-            if not self.client.bucket_exists(BUCKET_NAME):
-                self.client.make_bucket(BUCKET_NAME)
-                logger.info(f"✅ Created MinIO bucket '{BUCKET_NAME}'")
-        except Exception as e:
-            logger.error(f"❌ Error verifying MinIO bucket '{BUCKET_NAME}': {e}")
+            response = self._client.get_object(settings.minio_bucket_name, key)
+            return response.read()
+        except S3Error:
+            logger.exception("Failed to fetch object %s from bucket %s", key, settings.minio_bucket_name)
+            raise
+        finally:
+            try:
+                response.close()
+                response.release_conn()
+            except Exception:
+                pass
 
-    def upload_audio_bytes(self, audio_bytes: bytes, object_name: str) -> str:
-        """Uploads raw audio bytes directly to MinIO and returns the http access URL."""
-        try:
-            data_stream = io.BytesIO(audio_bytes)
-            stream_length = len(audio_bytes)
 
-            self.client.put_object(
-                bucket_name=BUCKET_NAME,
-                object_name=object_name,
-                data=data_stream,
-                length=stream_length,
-                content_type="audio/ogg",
-            )
-            logger.info(f"✅ Successfully uploaded {object_name} to MinIO")
-            return self.get_object_url(object_name)
-        except Exception as e:
-            logger.error(f"❌ Failed to upload {object_name} to MinIO: {e}")
-            raise e
-
-    def get_object_url(self, object_name: str) -> str:
-        """Generates static HTTP URL for MinIO object retrieval."""
-        protocol = "https" if MINIO_SECURE else "http"
-        clean_endpoint = MINIO_ENDPOINT.replace("http://", "").replace("https://", "")
-        return f"{protocol}://{clean_endpoint}/{BUCKET_NAME}/{object_name}"
+minio_service = MinioService()

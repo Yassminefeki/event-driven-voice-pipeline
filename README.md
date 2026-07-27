@@ -153,7 +153,7 @@ Early versions used `user_id` for routing, which caused race conditions when a u
 | `bot/asr_consumer.py` | Application Logic | **Bot Async Consumer.** Continuously listens to `audio.transcribed` Kafka events and replies directly to the Telegram user with the transcribed text. |
 | `utils/metrics.py` | Utility | **ASR Error Calculator.** Computes Word Error Rate (WER) and Character Error Rate (CER) using Levenshtein distance when users send corrected transcriptions. |
 | `main.py` | Entry Point | **Telegram Bot Application.** Initializes the Telegram bot client, registers event handlers, and launches the background ASR response loop. |
-| `asr_worker.py` | Entry Point | **Scalable ASR Worker.** Event-driven worker that consumes `audio.uploaded` tasks, fetches audio from MinIO, invokes Whisper ASR, and publishes `audio.transcribed`. |
+| `whisper_worker.py` | Entry Point | **Scalable ASR Worker.** Event-driven worker that consumes `audio.uploaded` tasks, fetches audio from MinIO, invokes Whisper ASR, and publishes `audio.transcribed`. |
 | `run.py` | Utility / Script | **Cross-Platform Launcher.** Python script for Linux and Windows that cleans up obsolete files, rebuilds Docker images without cache, starts services, and streams live logs. |
 | `minio-sink.json` | Connector Config | **Kafka Connect S3 Sink.** Configuration file that tells Kafka Connect to mirror audio metadata and transcriptions directly into MinIO S3 storage. |
 | `elasticsearch-sink.json` | Connector Config | **Kafka Connect ES Sink.** Configuration file that sinks Kafka event streams straight into Elasticsearch indices for analytics. |
@@ -266,3 +266,4 @@ curl "http://<es-host>:9200/transcription.corrected/_search?pretty"
 
 ## 📄 License
 
+Add your license of choice here (e.g., MIT).

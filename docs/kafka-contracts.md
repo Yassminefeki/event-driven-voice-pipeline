@@ -1,85 +1,71 @@
-# Contrats Kafka DataBot
+# Kafka Contracts — Source of Truth
 
-Version : 1.0
-Date : 2026-07-23
+This document is the **only** authorized reference for topic names and payload
+schemas. Any code that diverges from this file is a bug, not a variant.
 
-Ce document définit les contrats officiels des topics Kafka utilisés par DataBot.
+## Topics (do not rename)
 
-## `audio.uploaded`
+| Topic | Producer | Consumer(s) |
+|---|---|---|
+| `audio.uploaded` | Telegram Bot | MinIO Sink Connector, ASR Worker |
+| `audio.transcribed` | ASR Worker | Telegram Bot |
+| `transcription.corrected` | Telegram Bot | Elasticsearch Sink Connector |
 
-Ce topic transporte un fichier audio brut vers plusieurs consommateurs indépendants :
+## Correlation key
 
-- le MinIO Sink Connector, qui écrit l'audio dans le bucket `audio-archive` ;
-- l'ASR Worker, qui envoie le même audio à la Whisper API.
+`message_id` is the Kafka record key on **every** topic. Never use `user_id`
+or `chat_id` as the key — this was tried before and caused race conditions
+when a user sent multiple voice messages in quick succession.
 
-### Contrat de message
+## Payloads
 
-```text
-Kafka key     : message_id encodé en UTF-8
-Kafka value   : octets audio bruts, sans JSON ni Base64
-Kafka headers :
-  message_id  : identifiant du message Telegram
-  user_id     : identifiant Telegram de l'utilisateur
-  bucket      : nom du bucket MinIO cible
-  object_name : nom logique de l'objet audio
-  content_type: type MIME de l'audio, actuellement audio/ogg
-```
-
-La valeur Kafka est volontairement binaire. Ce format évite la surcharge du Base64 et permet au Sink Connector binaire et à l'ASR Worker de consommer exactement les mêmes octets. Les métadonnées nécessaires à la corrélation et au stockage sont dans les headers.
-
-Ce contrat remplace l'ancien modèle JSON contenant un champ `file_content`. Aucun consumer de `audio.uploaded` ne doit tenter de désérialiser la value en JSON.
-
-## `audio.transcribed`
-
-Ce topic transporte le résultat produit par l'ASR Worker.
-
-### Value JSON
-
+### `audio.uploaded`
 ```json
 {
-  "message_id": "123",
-  "user_id": "456",
-  "audio_url": "http://minio:9000/audio-archive/123.ogg",
-  "object_name": "123.ogg",
-  "transcription_initiale": "texte transcrit"
+  "message_id": "uuid",
+  "chat_id": 123456789,
+  "user_id": 987654321,
+  "telegram_file_id": "AwACAgQAAx...",
+  "audio_url": "s3://audio-archive/<message_id>.ogg",
+  "duration_seconds": 12,
+  "timestamp": "2026-07-27T10:00:00Z"
 }
 ```
 
-La key Kafka est `message_id`.
-
-Le bot Telegram consomme ce topic avec le groupe `bot-asr-consumer-group`.
-
-## `transcription.corrected`
-
-Ce topic transporte la décision de l'utilisateur après validation ou correction.
-
-### Value JSON
-
+### `audio.transcribed`
 ```json
 {
-  "message_id": "123",
-  "user_id": "456",
-  "audio_url": "http://minio:9000/audio-archive/123.ogg",
-  "transcription_initiale": "texte transcrit",
-  "transcription_corrigee": "texte corrigé",
-  "wer": 0.12,
-  "cer": 0.08,
-  "status": "corrected"
+  "message_id": "uuid",
+  "chat_id": 123456789,
+  "user_id": 987654321,
+  "audio_url": "s3://audio-archive/<message_id>.ogg",
+  "model_transcription": "text",
+  "asr_model_version": "whisper-large-v3",
+  "confidence_score": 0.94,
+  "processing_time_ms": 420,
+  "timestamp": "2026-07-27T10:00:01Z"
 }
 ```
 
-`status` vaut :
+### `transcription.corrected`
+```json
+{
+  "message_id": "uuid",
+  "chat_id": 123456789,
+  "user_id": 987654321,
+  "audio_url": "s3://audio-archive/<message_id>.ogg",
+  "model_transcription": "text",
+  "user_correction": "corrected text",
+  "wer": 0.0,
+  "cer": 0.02,
+  "is_edited": true,
+  "timestamp": "2026-07-27T10:00:15Z"
+}
+```
 
-- `kept` lorsque l'utilisateur valide la transcription initiale ;
-- `corrected` lorsque l'utilisateur fournit une correction.
+## Before merging any change
 
-La key Kafka est `message_id`. Le message est destiné à l'Elasticsearch Sink Connector.
-
-## Validation requise
-
-La présence de ces contrats dans le code ne prouve pas le fonctionnement de l'infrastructure. Une validation doit encore confirmer :
-
-- la valeur et les headers réellement présents dans `audio.uploaded` ;
-- l'écriture du fichier par MinIO Sink ;
-- la publication de `audio.transcribed` par le worker ;
-- l'indexation de `transcription.corrected` dans Elasticsearch.
+- [ ] Topic name matches this file exactly
+- [ ] `message_id` used as Kafka key on every `producer.send(...)`
+- [ ] `producer.send(...)` result is awaited/blocked on — never fire-and-forget
+- [ ] New fields added here first, then in code

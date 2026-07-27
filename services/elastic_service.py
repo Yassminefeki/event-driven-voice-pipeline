@@ -1,33 +1,29 @@
+"""
+Elasticsearch indexing layer (step 14: stores transcriptions + metadata).
+NOTE: in production this index is normally populated by the Elasticsearch
+Sink Connector (step 13) consuming `transcription.corrected` directly —
+this client is for manual queries / backfills / tests only.
+"""
 import logging
+
 from elasticsearch import Elasticsearch
-from config.settings import ELASTIC_PASSWORD, ELASTIC_URL, ELASTIC_USERNAME, INDEX_NAME
+
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
 
 class ElasticService:
-
     def __init__(self):
-        basic_auth = None
-        if ELASTIC_USERNAME and ELASTIC_PASSWORD:
-            basic_auth = (ELASTIC_USERNAME, ELASTIC_PASSWORD)
+        self._client = Elasticsearch(settings.elastic_url)
 
-        self.client = Elasticsearch(
-            hosts=[ELASTIC_URL],
-            basic_auth=basic_auth,
-            request_timeout=15,
-        )
+    def index_document(self, message_id: str, document: dict) -> None:
+        """message_id is used as the ES _id -> upsert semantics, no duplicates."""
+        self._client.index(index=settings.elastic_index, id=message_id, document=document)
 
-    def index_document(self, document_id: str, document: dict) -> bool:
-        """Indexes or updates a correction document in Elasticsearch."""
-        try:
-            res = self.client.index(
-                index=INDEX_NAME,
-                id=document_id,
-                document=document,
-            )
-            logger.info(f"✅ Indexed document {document_id} into '{INDEX_NAME}'. Result: {res.get('result')}")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Failed to index document {document_id} in Elasticsearch: {e}")
-            return False
+    def search(self, query: dict, size: int = 20) -> list[dict]:
+        result = self._client.search(index=settings.elastic_index, query=query, size=size)
+        return [hit["_source"] for hit in result["hits"]["hits"]]
+
+
+elastic_service = ElasticService()

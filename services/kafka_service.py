@@ -1,89 +1,108 @@
+"""
+Kafka producer/consumer wrapper.
+Enforces one rule above all others: `message_id` is ALWAYS the record key.
+This is what makes ordering per-message and Elasticsearch upserts idempotent.
+"""
 import json
-from kafka import KafkaProducer
-from config.settings import (
-    KAFKA_BOOTSTRAP_SERVERS,
-    AUDIO_RAW_TOPIC,
-    TRANSCRIPTION_COMPLETED_TOPIC,
-    TRANSCRIPTION_CORRECTED_TOPIC,
-)
+import logging
+from kafka import KafkaProducer, KafkaConsumer
+
+from config.settings import settings
+
+logger = logging.getLogger(__name__)
+
+
+def _serialize(value: dict) -> bytes:
+    return json.dumps(value).encode("utf-8")
+
+
+def _key(message_id: str) -> bytes:
+    return str(message_id).encode("utf-8")
 
 
 class KafkaService:
-
     def __init__(self):
-        bootstrap_list = [s.strip() for s in KAFKA_BOOTSTRAP_SERVERS.split(",") if s.strip()]
-        self.producer = KafkaProducer(
-            bootstrap_servers=bootstrap_list,
-            key_serializer=lambda key: key.encode("utf-8") if isinstance(key, str) else key,
-            max_request_size=20 * 1024 * 1024,  # 20 MB max request size
+        self._producer = None  # lazy init, created on first publish
+
+    @property
+    def producer(self) -> KafkaProducer:
+        if self._producer is None:
+            self._producer = KafkaProducer(
+                bootstrap_servers=list(settings.kafka_bootstrap_servers),
+                key_serializer=lambda k: k,
+                value_serializer=_serialize,
+                acks="all",
+            )
+        return self._producer
+
+    def publish(self, topic: str, message_id: str, payload: dict) -> None:
+        """Publishes and BLOCKS on the send future — never fire-and-forget.
+        A silent failure here was the root cause of a past production bug
+        where the bot logged "success" despite the topic not existing."""
+        future = self.producer.send(topic, key=_key(message_id), value=payload)
+        record_metadata = future.get(timeout=10)  # raises on failure — do not swallow
+        logger.info(
+            "Published message_id=%s to %s [partition=%s offset=%s]",
+            message_id, topic, record_metadata.partition, record_metadata.offset,
         )
 
-    def publish(self, topic: str, message: dict, key: str = None):
-        """Publishes a JSON metadata payload."""
-        payload_bytes = json.dumps(message, ensure_ascii=False).encode("utf-8")
-        self.producer.send(topic, value=payload_bytes, key=key)
-        self.producer.flush()
+    def publish_audio_uploaded(self, message_id: str, chat_id: int, user_id: int,
+                                telegram_file_id: str, audio_url: str,
+                                duration_seconds: int, timestamp: str) -> None:
+        self.publish(settings.topic_audio_uploaded, message_id, {
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "telegram_file_id": telegram_file_id,
+            "audio_url": audio_url,
+            "duration_seconds": duration_seconds,
+            "timestamp": timestamp,
+        })
 
-    def publish_audio(self, audio_bytes: bytes, object_name: str, message_id: str, user_id: str, bucket: str):
-        """Publishes raw audio binary data with headers."""
-        headers = build_audio_uploaded_headers(
-            message_id=message_id,
-            user_id=user_id,
-            bucket=bucket,
-            object_name=object_name,
+    def publish_audio_transcribed(self, message_id: str, chat_id: int, user_id: int,
+                                   audio_url: str, model_transcription: str,
+                                   asr_model_version: str, confidence_score: float,
+                                   processing_time_ms: int, timestamp: str) -> None:
+        self.publish(settings.topic_audio_transcribed, message_id, {
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "audio_url": audio_url,
+            "model_transcription": model_transcription,
+            "asr_model_version": asr_model_version,
+            "confidence_score": confidence_score,
+            "processing_time_ms": processing_time_ms,
+            "timestamp": timestamp,
+        })
+
+    def publish_transcription_corrected(self, message_id: str, chat_id: int, user_id: int,
+                                         audio_url: str, model_transcription: str,
+                                         user_correction: str, wer: float, cer: float,
+                                         is_edited: bool, timestamp: str) -> None:
+        self.publish(settings.topic_transcription_corrected, message_id, {
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "user_id": user_id,
+            "audio_url": audio_url,
+            "model_transcription": model_transcription,
+            "user_correction": user_correction,
+            "wer": wer,
+            "cer": cer,
+            "is_edited": is_edited,
+            "timestamp": timestamp,
+        })
+
+    @staticmethod
+    def make_consumer(topic: str, group_id: str) -> KafkaConsumer:
+        return KafkaConsumer(
+            topic,
+            bootstrap_servers=list(settings.kafka_bootstrap_servers),
+            group_id=group_id,
+            key_deserializer=lambda k: k.decode("utf-8") if k else None,
+            value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+            auto_offset_reset="earliest",
+            enable_auto_commit=True,
         )
-        self.producer.send(
-            AUDIO_RAW_TOPIC,
-            value=audio_bytes,
-            key=str(message_id),
-            headers=headers,
-        )
-        self.producer.flush()
 
 
-# ==================================================
-# Unified Builders for All Pipeline Topics
-# ==================================================
-
-def build_audio_uploaded_headers(message_id: str, user_id: str, bucket: str, object_name: str) -> list:
-    return [
-        ("message_id", str(message_id).encode("utf-8")),
-        ("user_id", str(user_id).encode("utf-8")),
-        ("bucket", str(bucket).encode("utf-8")),
-        ("object_name", str(object_name).encode("utf-8")),
-        ("content_type", b"audio/ogg"),
-    ]
-
-
-def build_audio_transcribed_message(
-    message_id: str, user_id: str, audio_url: str, transcription_initiale: str, object_name: str = None
-) -> dict:
-    return {
-        "message_id": message_id,
-        "user_id": user_id,
-        "audio_url": audio_url,
-        "object_name": object_name,
-        "transcription_initiale": transcription_initiale,
-    }
-
-
-def build_transcription_corrected_message(
-    message_id: str,
-    user_id: str,
-    audio_url: str,
-    transcription_initiale: str,
-    transcription_corrigee: str,
-    wer: float,
-    cer: float,
-    status: str = "completed",
-) -> dict:
-    return {
-        "message_id": message_id,
-        "user_id": user_id,
-        "audio_url": audio_url,
-        "transcription_initiale": transcription_initiale,
-        "transcription_corrigee": transcription_corrigee,
-        "wer": float(wer),
-        "cer": float(cer),
-        "status": status,
-    }
+kafka_service = KafkaService()
