@@ -2,7 +2,7 @@ import unittest
 
 from services.kafka_service import (
     AUDIO_RAW_TOPIC,
-    AUDIO_TRANSCRIBED_TOPIC,
+    TRANSCRIPTION_COMPLETED_TOPIC,
     TRANSCRIPTION_CORRECTED_TOPIC,
     build_audio_transcribed_message,
     build_transcription_corrected_message,
@@ -12,7 +12,7 @@ from services.kafka_service import (
 class KafkaPayloadTests(unittest.TestCase):
     def test_topics_match_architecture(self):
         self.assertEqual(AUDIO_RAW_TOPIC, "audio.uploaded")
-        self.assertEqual(AUDIO_TRANSCRIBED_TOPIC, "audio.transcribed")
+        self.assertEqual(TRANSCRIPTION_COMPLETED_TOPIC, "audio.transcribed")
         self.assertEqual(TRANSCRIPTION_CORRECTED_TOPIC, "transcription.corrected")
 
     def test_audio_transcribed_payload_contains_transcription(self):

@@ -30,7 +30,7 @@ Ce rapport consigne uniquement les vérifications réellement exécutées depuis
 ## Changements appliqués avant validation
 
 - Le topic ASR a été harmonisé sur `audio.transcribed`.
-- La constante est `AUDIO_TRANSCRIBED_TOPIC`.
+- La constante est `TRANSCRIPTION_COMPLETED_TOPIC`.
 - Le contrat binaire `audio.uploaded` est documenté.
 - `connectors/minio-sink.json` est présent pour le Sink MinIO.
 - `connectors/elasticsearch-sink.json` a été ajouté pour `transcription.corrected`.

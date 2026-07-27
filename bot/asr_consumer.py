@@ -7,7 +7,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application
 
 from bot.memory import last_transcription
-from config.settings import AUDIO_TRANSCRIBED_TOPIC, KAFKA_BOOTSTRAP_SERVERS
+from config.settings import TRANSCRIPTION_COMPLETED_TOPIC, KAFKA_BOOTSTRAP_SERVERS
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,7 @@ def _consume_loop(app: Application, loop: asyncio.AbstractEventLoop) -> None:
     bootstrap_list = [s.strip() for s in KAFKA_BOOTSTRAP_SERVERS.split(",") if s.strip()]
     
     consumer = KafkaConsumer(
-        AUDIO_TRANSCRIBED_TOPIC,
+        TRANSCRIPTION_COMPLETED_TOPIC,
         bootstrap_servers=bootstrap_list,
         group_id="bot-asr-consumer-group",
         auto_offset_reset="latest",
@@ -26,7 +26,7 @@ def _consume_loop(app: Application, loop: asyncio.AbstractEventLoop) -> None:
         value_deserializer=lambda v: json.loads(v.decode("utf-8")) if v else {},
     )
 
-    logger.info(f">>> [Kafka Consumer] Listening on topic '{AUDIO_TRANSCRIBED_TOPIC}'...")
+    logger.info(f">>> [Kafka Consumer] Listening on topic '{TRANSCRIPTION_COMPLETED_TOPIC}'...")
 
     for message in consumer:
         try:
