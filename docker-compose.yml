@@ -35,7 +35,7 @@ services:
       dockerfile: Dockerfile
     container_name: whisper_asr_worker
     restart: unless-stopped
-    command: python whisper_worker.py
+    command: python asr_worker.py
     env_file:
       - .env
     environment:

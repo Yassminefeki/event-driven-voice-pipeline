@@ -41,7 +41,7 @@ Telegram
 | 3. Le bot publie dans Kafka | Fonctionne sous conditions | `audio.uploaded` est publié avec `publish_audio`. |
 | 4. Kafka reçoit le message | Fonctionne sous conditions | Kafka doit être disponible et accepter des messages jusqu'à 20 Mo. |
 | 5. MinIO Sink Connector | Non validé | Une configuration existe, mais le connecteur n'est pas installé ni déployé depuis le projet. |
-| 6. L'ASR Worker consomme en parallèle | Fonctionne | `whisper_worker.py` consomme `audio.uploaded` avec un groupe Kafka différent. |
+| 6. L'ASR Worker consomme en parallèle | Fonctionne | `asr_worker.py` consomme `audio.uploaded` avec un groupe Kafka différent. |
 | 7. Le worker appelle la Whisper API | Fonctionne sous conditions | Le worker utilise `WhisperService`, avec l'endpoint et la clé API provenant de `.env`. |
 | 8. La Whisper API renvoie la transcription | Fonctionne sous conditions | Cela dépend de l'endpoint, de la clé API et du format de réponse de l'API. |
 | 9. Le worker publie la transcription | Câblé | Le worker publie sur `audio.transcribed`. |

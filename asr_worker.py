@@ -1,4 +1,4 @@
-# whisper_worker.py
+# asr_worker.py
 import base64
 from services.kafka_service import create_kafka_consumer, send_kafka_event
 from services.whisper_service import transcribe_audio_bytes

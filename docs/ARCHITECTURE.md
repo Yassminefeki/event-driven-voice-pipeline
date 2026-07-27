@@ -37,7 +37,7 @@ Point d'entrée unique du bot Telegram. Il enregistre :
 
 Consomme `audio.transcribed` avec le groupe `bot-asr-consumer-group`, mémorise la transcription initiale et envoie les boutons Telegram à l'utilisateur.
 
-### `whisper_worker.py`
+### `asr_worker.py`
 
 Consomme `audio.uploaded` avec le groupe `whisper-worker-group`, écrit temporairement les octets audio, appelle `WhisperService`, puis publie le résultat sur `audio.transcribed`.
 
