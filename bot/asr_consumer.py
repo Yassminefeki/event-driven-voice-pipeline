@@ -1,12 +1,22 @@
-```python
+
 """
 Step 10: bot consumes audio.transcribed and sends the transcription
 back to the user for validation.
 """
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
+"""
+Step 10: bot consumes audio.transcribed and sends the transcription
+back to the user for validation.
+"""
+
 import asyncio
 import logging
 
-from telegram import Bot
+from telegram import (
+    Bot,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 
 from config.settings import settings
 from services.kafka_service import kafka_service
@@ -28,8 +38,7 @@ async def run_asr_consumer_loop(
     loop = asyncio.get_event_loop()
 
     while True:
-        # kafka-python is sync; run polling in a thread
-        # to avoid blocking the event loop
+
         records = await loop.run_in_executor(
             None,
             lambda: consumer.poll(timeout_ms=1000)
@@ -44,24 +53,39 @@ async def run_asr_consumer_loop(
                 chat_id = event["chat_id"]
 
                 session = pending_transcriptions.setdefault(
-                    message_id, {}
+                    message_id,
+                    {}
                 )
 
                 session["chat_id"] = chat_id
+                session["user_id"] = event["user_id"]
                 session["model_transcription"] = event["model_transcription"]
                 session["audio_url"] = event["audio_url"]
+
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(
+                            "✅ Valider",
+                            callback_data=f"validate:{message_id}"
+                        ),
+                        InlineKeyboardButton(
+                            "✏️ Corriger",
+                            callback_data=f"correct:{message_id}"
+                        ),
+                    ]
+                ])
 
                 sent = await bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"📝 Transcription :\n\n"
-                        f"{event['model_transcription']}\n\n"
-                        "Répondez à ce message pour corriger si nécessaire."
+                        "📝 <b>Transcription</b>\n\n"
+                        f"<blockquote>{event['model_transcription']}</blockquote>\n\n"
+                        "Choisissez une action :"
                     ),
+                    parse_mode="HTML",
+                    reply_markup=keyboard,
                 )
 
-                # Map Telegram's sent message ID
-                # to the original Kafka message ID
                 message_id_map[sent.message_id] = message_id
 
                 logger.info(
@@ -69,4 +93,3 @@ async def run_asr_consumer_loop(
                     message_id,
                     chat_id,
                 )
-```

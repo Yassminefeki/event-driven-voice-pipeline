@@ -1,10 +1,16 @@
 """
 Telegram event handlers.
-Step 1: user sends voice note.
-Step 2: bot downloads audio + builds metadata.
-Step 3: bot publishes to audio.uploaded.
-Step 11-12: user correction -> transcription.corrected.
+
+Step 1-3:
+    User sends voice -> audio.uploaded
+
+Step 10:
+    Whisper transcription -> audio.transcribed
+
+Step 11-12:
+    User validates or corrects -> transcription.corrected
 """
+
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -18,24 +24,28 @@ from utils.metrics import compute_wer, compute_cer
 
 logger = logging.getLogger(__name__)
 
-# In-memory session store: message_id -> last model transcription (for WER/CER diffing).
-# Swap for Redis/DB if the bot needs to survive restarts.
 
+async def handle_voice_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+) -> None:
 
-
-async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Step 1 + 2 + 3."""
     voice = update.message.voice
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
-    message_id = str(uuid.uuid4())  # correlation key used everywhere downstream
+
+    message_id = str(uuid.uuid4())
 
     telegram_file = await context.bot.get_file(voice.file_id)
     audio_bytes = await telegram_file.download_as_bytearray()
 
-    audio_url = minio_service.upload_audio(message_id, bytes(audio_bytes))
+    audio_url = minio_service.upload_audio(
+        message_id,
+        bytes(audio_bytes)
+    )
 
     timestamp = datetime.now(timezone.utc).isoformat()
+
     kafka_service.publish_audio_uploaded(
         message_id=message_id,
         chat_id=chat_id,
@@ -46,44 +56,206 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         timestamp=timestamp,
     )
 
-    pending_transcriptions = context.application.bot_data["pending_transcriptions"]
+    # IMPORTANT :
+    # On utilise le même dictionnaire que asr_consumer.py
+    pending_transcriptions = context.application.bot_data[
+        "pending_transcriptions"
+    ]
 
     pending_transcriptions[message_id] = {
         "chat_id": chat_id,
         "user_id": user_id,
         "audio_url": audio_url,
     }
-    logger.info("message_id=%s uploaded, awaiting transcription", message_id)
+
+    logger.info(
+        "message_id=%s uploaded, awaiting transcription",
+        message_id
+    )
 
 
-async def handle_text_correction(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Step 11 + 12: user replies with a corrected transcription."""
-    reply_to = update.message.reply_to_message
-    if not reply_to or reply_to.message_id not in context.bot_data.get("message_id_map", {}):
-        return  # not a correction reply we're tracking
+async def handle_transcription_action(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+) -> None:
 
-    message_id = context.bot_data["message_id_map"][reply_to.message_id]
-    pending_transcriptions = context.application.bot_data["pending_transcriptions"]
-    session = pending_transcriptions.get(message_id)
-    if not session:
-        logger.warning("No pending session for message_id=%s, skipping correction", message_id)
+    query = update.callback_query
+
+    await query.answer()
+
+    data = query.data
+
+    if ":" not in data:
         return
 
-    model_transcription = session.get("model_transcription", "")
+    action, message_id = data.split(":", 1)
+
+    pending_transcriptions = context.application.bot_data[
+        "pending_transcriptions"
+    ]
+
+    session = pending_transcriptions.get(message_id)
+
+    if not session:
+        await query.edit_message_text(
+            "⚠️ Cette transcription n'est plus disponible."
+        )
+        return
+
+    # ==========================================
+    # ✅ VALIDER
+    # ==========================================
+
+    if action == "validate":
+
+        model_transcription = session.get(
+            "model_transcription",
+            ""
+        )
+
+        audio_url = session.get(
+            "audio_url",
+            ""
+        )
+
+        kafka_service.publish_transcription_corrected(
+            message_id=message_id,
+            chat_id=session["chat_id"],
+            user_id=session["user_id"],
+            audio_url=audio_url,
+            model_transcription=model_transcription,
+            user_correction=model_transcription,
+            wer=0.0,
+            cer=0.0,
+            is_edited=False,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+
+        await query.edit_message_text(
+            "✅ <b>Transcription validée !</b>\n\n"
+            f"{model_transcription}",
+            parse_mode="HTML",
+        )
+
+        pending_transcriptions.pop(message_id, None)
+
+        logger.info(
+            "message_id=%s transcription validated",
+            message_id
+        )
+
+        return
+
+    # ==========================================
+    # ✏️ CORRIGER
+    # ==========================================
+
+    if action == "correct":
+
+        awaiting_corrections = context.application.bot_data[
+            "awaiting_corrections"
+        ]
+
+        chat_id = query.message.chat_id
+
+        awaiting_corrections[chat_id] = message_id
+
+        await query.edit_message_text(
+            "✏️ <b>Correction</b>\n\n"
+            "Copiez la transcription ci-dessous, "
+            "modifiez-la si nécessaire, puis envoyez-la "
+            "simplement comme un nouveau message :\n\n"
+            f"<blockquote>{session.get('model_transcription', '')}</blockquote>",
+            parse_mode="HTML",
+        )
+
+        logger.info(
+            "message_id=%s waiting for user correction",
+            message_id
+        )
+
+
+async def handle_text_correction(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+) -> None:
+
+    if not update.message or not update.message.text:
+        return
+
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    awaiting_corrections = context.application.bot_data[
+        "awaiting_corrections"
+    ]
+
+    # Le bot attend-il une correction pour ce chat ?
+    message_id = awaiting_corrections.get(chat_id)
+
+    if not message_id:
+        return
+
+    pending_transcriptions = context.application.bot_data[
+        "pending_transcriptions"
+    ]
+
+    session = pending_transcriptions.get(message_id)
+
+    if not session:
+        logger.warning(
+            "No pending session for message_id=%s",
+            message_id
+        )
+        return
+
+    model_transcription = session.get(
+        "model_transcription",
+        ""
+    )
+
     user_correction = update.message.text
-    wer = compute_wer(model_transcription, user_correction)
-    cer = compute_cer(model_transcription, user_correction)
+
+    audio_url = session.get(
+        "audio_url",
+        ""
+    )
+
+    wer = compute_wer(
+        model_transcription,
+        user_correction
+    )
+
+    cer = compute_cer(
+        model_transcription,
+        user_correction
+    )
 
     kafka_service.publish_transcription_corrected(
         message_id=message_id,
-        chat_id=session["chat_id"],
-        user_id=session["user_id"],
-        audio_url=session.get("audio_url", ""),
+        chat_id=chat_id,
+        user_id=user_id,
+        audio_url=audio_url,
         model_transcription=model_transcription,
         user_correction=user_correction,
         wer=wer,
         cer=cer,
-        is_edited=(user_correction.strip() != model_transcription.strip()),
+        is_edited=(
+            user_correction.strip()
+            != model_transcription.strip()
+        ),
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
-    await update.message.reply_text("✅ Correction enregistrée, merci !")
+
+    await update.message.reply_text(
+        "✅ Correction enregistrée, merci !"
+    )
+
+    # Nettoyage
+    pending_transcriptions.pop(message_id, None)
+    awaiting_corrections.pop(chat_id, None)
+
+    logger.info(
+        "message_id=%s correction saved",
+        message_id
+    )
