@@ -14,12 +14,13 @@ Step 11-12:
 import logging
 import uuid
 from datetime import datetime, timezone
+import base64
 
 from telegram import Update
 from telegram.ext import ContextTypes
 
 from services.kafka_service import kafka_service
-from services.minio_service import minio_service
+
 from utils.metrics import compute_wer, compute_cer
 
 logger = logging.getLogger(__name__)
@@ -39,25 +40,24 @@ async def handle_voice_message(
     telegram_file = await context.bot.get_file(voice.file_id)
     audio_bytes = await telegram_file.download_as_bytearray()
 
-    audio_url = minio_service.upload_audio(
-        message_id,
+    # Audio → Base64
+    audio_base64 = base64.b64encode(
         bytes(audio_bytes)
-    )
+    ).decode("utf-8")
 
     timestamp = datetime.now(timezone.utc).isoformat()
 
+    # Kafka AVANT MinIO
     kafka_service.publish_audio_uploaded(
         message_id=message_id,
         chat_id=chat_id,
         user_id=user_id,
         telegram_file_id=voice.file_id,
-        audio_url=audio_url,
+        audio_base64=audio_base64,
         duration_seconds=voice.duration,
         timestamp=timestamp,
     )
 
-    # IMPORTANT :
-    # On utilise le même dictionnaire que asr_consumer.py
     pending_transcriptions = context.application.bot_data[
         "pending_transcriptions"
     ]
@@ -65,11 +65,10 @@ async def handle_voice_message(
     pending_transcriptions[message_id] = {
         "chat_id": chat_id,
         "user_id": user_id,
-        "audio_url": audio_url,
     }
 
     logger.info(
-        "message_id=%s uploaded, awaiting transcription",
+        "message_id=%s audio published to Kafka",
         message_id
     )
 

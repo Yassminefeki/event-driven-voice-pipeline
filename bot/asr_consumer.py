@@ -1,9 +1,3 @@
-
-"""
-Step 10: bot consumes audio.transcribed and sends the transcription
-back to the user for validation.
-"""
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 """
 Step 10: bot consumes audio.transcribed and sends the transcription
 back to the user for validation.
@@ -60,7 +54,7 @@ async def run_asr_consumer_loop(
                 session["chat_id"] = chat_id
                 session["user_id"] = event["user_id"]
                 session["model_transcription"] = event["model_transcription"]
-                session["audio_url"] = event["audio_url"]
+                session["audio_url"] = event.get("audio_url", "")
 
                 keyboard = InlineKeyboardMarkup([
                     [

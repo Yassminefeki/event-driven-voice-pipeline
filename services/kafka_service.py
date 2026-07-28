@@ -47,14 +47,14 @@ class KafkaService:
         )
 
     def publish_audio_uploaded(self, message_id: str, chat_id: int, user_id: int,
-                                telegram_file_id: str, audio_url: str,
+                                telegram_file_id: str, audio_base64: str,
                                 duration_seconds: int, timestamp: str) -> None:
         self.publish(settings.topic_audio_uploaded, message_id, {
             "message_id": message_id,
             "chat_id": chat_id,
             "user_id": user_id,
             "telegram_file_id": telegram_file_id,
-            "audio_url": audio_url,
+            "audio_base64": audio_base64,
             "duration_seconds": duration_seconds,
             "timestamp": timestamp,
         })
