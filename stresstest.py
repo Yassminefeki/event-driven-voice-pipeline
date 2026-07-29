@@ -1,126 +1,359 @@
+```python
 import base64
 import json
+import os
 import random
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
-import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from kafka import KafkaProducer
 
-# Configuration Defaults
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+KAFKA_BOOTSTRAP = os.getenv(
+    "KAFKA_BOOTSTRAP_SERVERS",
+    "kafka1:9092,kafka2:9092,kafka3:9092"
+)
+
 TOPIC = "audio.uploaded"
 SAMPLE_AUDIO_PATH = "sample_test.ogg"
 
 
-def get_user_inputs():
-    print("=" * 60)
-    print("🔥 TELEGRAM ASR PIPELINE - STRESS TEST CONFIGURATION 🔥")
-    print("=" * 60)
+# ============================================================
+# CONFIGURATION DU TEST
+# ============================================================
 
-    # 1. Check if sample audio file exists
-    if not os.path.exists(SAMPLE_AUDIO_PATH):
-        print(f"❌ Error: Could not find sample audio file at '{SAMPLE_AUDIO_PATH}'")
-        print(
-            "Please place a valid '.ogg' file in the root directory named 'sample_test.ogg'."
-        )
+def get_user_inputs():
+
+    print("=" * 65)
+    print("🔥 TELEGRAM ASR PIPELINE - STRESS TEST 🔥")
+    print("=" * 65)
+
+    # Vérification du fichier audio
+    if not os.path.isfile(SAMPLE_AUDIO_PATH):
+        print()
+        print(f"❌ Fichier audio introuvable : {SAMPLE_AUDIO_PATH}")
+        print()
+        print("Place un fichier .ogg dans :")
+        print(os.path.abspath(SAMPLE_AUDIO_PATH))
+        print()
         sys.exit(1)
 
-    # 2. Interactive Prompts
     try:
         num_users = int(
-            input("👉 Enter the number of simulated users (e.g., 50): ")
+            input("👉 Nombre d'utilisateurs simulés (ex: 50) : ")
         )
+
         msgs_per_user = int(
-            input(
-                "👉 Enter the number of voice messages per user (e.g., 5): "
-            )
+            input("👉 Nombre de vocaux par utilisateur (ex: 5) : ")
         )
+
         concurrency = int(
-            input(
-                "👉 Enter number of parallel worker threads for producing (e.g., 10): "
-            )
+            input("👉 Nombre de threads parallèles (ex: 10) : ")
         )
+
     except ValueError:
-        print("❌ Invalid input. Please enter valid integers.")
+        print("❌ Les valeurs doivent être des nombres entiers.")
+        sys.exit(1)
+
+    if num_users <= 0 or msgs_per_user <= 0 or concurrency <= 0:
+        print("❌ Les valeurs doivent être supérieures à 0.")
         sys.exit(1)
 
     total_messages = num_users * msgs_per_user
-    print("\n" + "-" * 60)
-    print(f"📊 Test Summary:")
-    print(f"   • Simulated Users:    {num_users}")
-    print(f"   • Messages per User: {msgs_per_user}")
-    print(f"   • Total Voice Notes:  {total_messages}")
-    print(f"   • Parallel Threads:   {concurrency}")
-    print("-" * 60)
 
-    confirm = input("🚀 Launch stress test? (y/N): ").strip().lower()
-    if confirm != "y":
-        print("Aborted.")
+    print()
+    print("-" * 65)
+    print("📊 CONFIGURATION DU TEST")
+    print("-" * 65)
+    print(f"👥 Utilisateurs simulés : {num_users}")
+    print(f"🎤 Vocaux/utilisateur   : {msgs_per_user}")
+    print(f"📨 Total messages       : {total_messages}")
+    print(f"⚡ Threads parallèles   : {concurrency}")
+    print(f"📡 Kafka                 : {KAFKA_BOOTSTRAP}")
+    print(f"📌 Topic                 : {TOPIC}")
+    print("-" * 65)
+
+    confirmation = input("🚀 Lancer le test ? (y/N) : ").strip().lower()
+
+    if confirmation != "y":
+        print("❌ Test annulé.")
         sys.exit(0)
 
     return num_users, msgs_per_user, concurrency, total_messages
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
-    num_users, msgs_per_user, concurrency, total_messages = get_user_inputs()
 
-    # Load audio binary & encode base64
-    with open(SAMPLE_AUDIO_PATH, "rb") as f:
-        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+    (
+        num_users,
+        msgs_per_user,
+        concurrency,
+        total_messages
+    ) = get_user_inputs()
 
-    # Generate pool of simulated user IDs and chat IDs
+    # --------------------------------------------------------
+    # Lecture du fichier audio
+    # --------------------------------------------------------
+
+    print()
+    print("🎵 Lecture du fichier audio...")
+
+    try:
+        with open(SAMPLE_AUDIO_PATH, "rb") as audio_file:
+            audio_bytes = audio_file.read()
+
+    except Exception as e:
+        print(f"❌ Impossible de lire le fichier audio : {e}")
+        sys.exit(1)
+
+    audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
+
+    print(f"✅ Audio chargé : {len(audio_bytes):,} octets")
+    print(f"✅ Base64 généré : {len(audio_base64):,} caractères")
+
+    # --------------------------------------------------------
+    # Création des utilisateurs simulés
+    # --------------------------------------------------------
+
     users = [
-        {"user_id": 100000 + i, "chat_id": 900000 + i} for i in range(num_users)
+        {
+            "user_id": 100000 + i,
+            "chat_id": 900000 + i
+        }
+        for i in range(num_users)
     ]
 
-    producer = KafkaProducer(
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        acks=1,
-    )
+    # --------------------------------------------------------
+    # Création du Producer Kafka
+    # --------------------------------------------------------
 
-    # Build sequence of message dispatch tasks
+    print()
+    print("🔌 Connexion à Kafka...")
+
+    try:
+
+        producer = KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP.split(","),
+            value_serializer=lambda value:
+                json.dumps(value).encode("utf-8"),
+
+            # Confirmation du broker
+            acks="all",
+
+            # Retry automatique
+            retries=5,
+
+            # Timeout
+            request_timeout_ms=30000,
+
+            # Évite que Kafka bloque trop longtemps
+            max_block_ms=30000
+        )
+
+    except Exception as e:
+
+        print("❌ Impossible de créer le Kafka Producer.")
+        print(e)
+        sys.exit(1)
+
+    print("✅ Producer Kafka connecté.")
+
+    # --------------------------------------------------------
+    # Génération des messages
+    # --------------------------------------------------------
+
     tasks = []
-    msg_counter = 10000
-    for u in users:
-        for _ in range(msgs_per_user):
-            msg_counter += 1
-            tasks.append(
-                {
-                    "message_id": msg_counter,
-                    "chat_id": u["chat_id"],
-                    "user_id": u["user_id"],
-                    "file_name": f"{msg_counter}.ogg",
-                    "audio_data": audio_b64,
-                    "duration": random.randint(3, 15),
-                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                }
-            )
 
-    # Shuffle task queue to simulate random interleaved messaging across users
+    message_counter = int(time.time() * 1000)
+
+    for user in users:
+
+        for message_index in range(msgs_per_user):
+
+            message_counter += 1
+
+            payload = {
+                "message_id": str(message_counter),
+
+                "chat_id": user["chat_id"],
+
+                "user_id": user["user_id"],
+
+                "telegram_file_id":
+                    f"stress-test-{message_counter}",
+
+                "file_name":
+                    f"stress-{message_counter}.ogg",
+
+                "audio_base64":
+                    audio_base64,
+
+                "duration_seconds":
+                    random.randint(3, 15),
+
+                "timestamp":
+                    time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ",
+                        time.gmtime()
+                    ),
+
+                "stress_test": True
+            }
+
+            tasks.append(payload)
+
+    # Mélange des utilisateurs pour simuler
+    # plusieurs utilisateurs en même temps
     random.shuffle(tasks)
 
-    def send_event(payload):
-        producer.send(TOPIC, payload)
+    # --------------------------------------------------------
+    # Envoi vers Kafka
+    # --------------------------------------------------------
 
-    print(f"\n🚀 Ingesting {total_messages} events into Kafka topic '{TOPIC}'...")
+    print()
+    print("=" * 65)
+    print(f"🚀 ENVOI DE {total_messages} MESSAGES")
+    print(f"📡 Destination : {TOPIC}")
+    print("=" * 65)
+
     start_time = time.time()
 
-    with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        list(executor.map(send_event, tasks))
+    success_count = 0
+    failed_count = 0
 
-    producer.flush()
+    # --------------------------------------------------------
+    # Fonction d'envoi
+    # --------------------------------------------------------
+
+    def send_event(payload):
+
+        try:
+
+            future = producer.send(
+                TOPIC,
+                value=payload
+            )
+
+            # IMPORTANT :
+            # attend la confirmation réelle de Kafka
+            metadata = future.get(timeout=30)
+
+            return {
+                "success": True,
+                "message_id": payload["message_id"],
+                "partition": metadata.partition,
+                "offset": metadata.offset
+            }
+
+        except Exception as e:
+
+            return {
+                "success": False,
+                "message_id": payload["message_id"],
+                "error": str(e)
+            }
+
+    # --------------------------------------------------------
+    # Threads parallèles
+    # --------------------------------------------------------
+
+    with ThreadPoolExecutor(
+        max_workers=concurrency
+    ) as executor:
+
+        futures = [
+            executor.submit(send_event, payload)
+            for payload in tasks
+        ]
+
+        for future in as_completed(futures):
+
+            result = future.result()
+
+            if result["success"]:
+
+                success_count += 1
+
+                print(
+                    f"✅ [{success_count}/{total_messages}] "
+                    f"message={result['message_id']} "
+                    f"partition={result['partition']} "
+                    f"offset={result['offset']}"
+                )
+
+            else:
+
+                failed_count += 1
+
+                print(
+                    f"❌ message={result['message_id']} "
+                    f"ERREUR={result['error']}"
+                )
+
+    # --------------------------------------------------------
+    # Flush final
+    # --------------------------------------------------------
+
+    try:
+        producer.flush(timeout=30)
+    except Exception as e:
+        print(f"⚠️ Erreur pendant flush : {e}")
+
+    producer.close()
+
     elapsed = time.time() - start_time
 
-    throughput = total_messages / elapsed if elapsed > 0 else total_messages
-    print("\n" + "=" * 60)
-    print("✅ STRESS TEST INJECTION COMPLETE")
-    print(f"   • Total Sent:   {total_messages} messages")
-    print(f"   • Total Time:   {elapsed:.2f} seconds")
-    print(f"   • Ingestion Rate: {throughput:.1f} msg/sec")
-    print("=" * 60 + "\n")
+    throughput = (
+        total_messages / elapsed
+        if elapsed > 0
+        else 0
+    )
+
+    # --------------------------------------------------------
+    # Résultat
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 65)
+    print("🔥 RÉSULTAT DU STRESS TEST")
+    print("=" * 65)
+
+    print(f"📨 Messages demandés : {total_messages}")
+    print(f"✅ Messages confirmés : {success_count}")
+    print(f"❌ Messages échoués   : {failed_count}")
+    print(f"⏱️ Temps total        : {elapsed:.2f} secondes")
+    print(f"⚡ Débit              : {throughput:.2f} msg/sec")
+
+    print("=" * 65)
+
+    if success_count == total_messages:
+
+        print()
+        print("🎉 TEST RÉUSSI !")
+        print(
+            f"Kafka a confirmé les {total_messages} messages."
+        )
+
+    else:
+
+        print()
+        print("⚠️ TEST INCOMPLET !")
+        print(
+            f"{failed_count} messages n'ont pas été confirmés par Kafka."
+        )
+
+    print()
 
 
 if __name__ == "__main__":
     main()
+```
