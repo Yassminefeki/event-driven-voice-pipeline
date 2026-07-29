@@ -10,7 +10,7 @@ Step 10:
 Step 11-12:
     User validates or corrects -> transcription.corrected
 """
-
+import html
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -159,12 +159,16 @@ async def handle_transcription_action(
 
         awaiting_corrections[chat_id] = message_id
 
+        transcription_text = html.escape(
+            session.get("model_transcription", "")
+        )
+
         await query.edit_message_text(
             "✏️ <b>Correction</b>\n\n"
-            "Copiez la transcription ci-dessous, "
-            "modifiez-la si nécessaire, puis envoyez-la "
-            "simplement comme un nouveau message :\n\n"
-            f"<blockquote>{session.get('model_transcription', '')}</blockquote>",
+            "Appuyez sur le texte ci-dessous pour le copier, "
+            "collez-le, modifiez-le si nécessaire, puis envoyez-le "
+            "comme un nouveau message :\n\n"
+            f"<code>{transcription_text}</code>",
             parse_mode="HTML",
         )
 
