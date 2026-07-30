@@ -91,17 +91,7 @@ async def run_asr_consumer_loop(
                         reply_markup=keyboard,
                     )
 
-                    # ForceReply : permet à l'utilisateur de répondre
-                    # directement à la transcription.
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text="✏️ Vous pouvez répondre directement à ce message pour proposer une correction.",
-                        reply_to_message_id=sent.message_id,
-                        reply_markup=ForceReply(
-                            selective=True
-                        ),
-                    )
-
+                    
                 except TelegramError:
                     # Une erreur Telegram sur CE message ne doit jamais
                     # interrompre la consommation des messages suivants.
