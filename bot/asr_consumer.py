@@ -1,15 +1,18 @@
+
 """
 Step 10: bot consumes audio.transcribed and sends the transcription
 back to the user for validation.
 """
 
 import asyncio
+import html
 import logging
 
 from telegram import (
     Bot,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ForceReply,
 )
 from telegram.error import TelegramError
 
@@ -71,19 +74,36 @@ async def run_asr_consumer_loop(
                 ])
 
                 try:
+                    safe_transcription = html.escape(
+                        event["model_transcription"]
+                    )
+
+                    # Message principal : transcription + boutons
                     sent = await bot.send_message(
                         chat_id=chat_id,
                         text=(
                             "📝 <b>Transcription</b>\n\n"
-                            f"<blockquote>{event['model_transcription']}</blockquote>\n\n"
+                            "<i>Appuyez sur le texte pour le copier</i>\n\n"
+                            f"<code>{safe_transcription}</code>\n\n"
                             "Choisissez une action :"
                         ),
                         parse_mode="HTML",
                         reply_markup=keyboard,
                     )
+
+                    # ForceReply : permet à l'utilisateur de répondre
+                    # directement à la transcription.
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text="✏️ Vous pouvez répondre directement à ce message pour proposer une correction.",
+                        reply_to_message_id=sent.message_id,
+                        reply_markup=ForceReply(
+                            selective=True
+                        ),
+                    )
+
                 except TelegramError:
-                    # Une erreur Telegram sur CE message (chat introuvable,
-                    # utilisateur ayant bloqué le bot, etc.) ne doit jamais
+                    # Une erreur Telegram sur CE message ne doit jamais
                     # interrompre la consommation des messages suivants.
                     logger.exception(
                         "message_id=%s: échec d'envoi Telegram à chat_id=%s, "
@@ -100,3 +120,4 @@ async def run_asr_consumer_loop(
                     message_id,
                     chat_id,
                 )
+
