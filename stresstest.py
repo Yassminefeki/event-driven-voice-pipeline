@@ -1,27 +1,37 @@
 
 #!/usr/bin/env python3
 """
-Injecteur de charge pour le pipeline ASR.
+stresstest.py
+=============
+Test de charge intelligent de toute la pipeline :
 
-Publie directement sur le topic audio.uploaded avec le même format
-que KafkaService.publish_audio_uploaded().
+Telegram/Bot (simulé)
+        ↓
+Kafka audio.uploaded
+        ↓
+Kafka Connect → MinIO
+        ↓
+publisher.py → audio.stored
+        ↓
+Whisper Worker → audio.transcribed
+        ↓
+correction → transcription.corrected
+        ↓
+Kafka Connect → Elasticsearch
+
+Le script ne modifie PAS la partition Kafka.
+Kafka choisit automatiquement la partition en fonction de la clé message_id.
 
 Exemples :
 
-    # Test simple : 1 message/s pendant 30 secondes
-    python3 stresstest.py
+1) Test simple :
+   python3 stresstest.py --rate 1 --duration 30 --audio-file sample.ogg
 
-    # 5 messages/s pendant 60 secondes
-    python3 stresstest.py --rate 5 --duration 60
+2) Test progressif :
+   python3 stresstest.py --steps "1:30,2:30,5:30,10:30" --audio-file sample.ogg
 
-    # Avec un vrai fichier audio
-    python3 stresstest.py --rate 1 --duration 30 --audio-file test.ogg
-
-    # Avec des données synthétiques
-    python3 stresstest.py --rate 1 --duration 30 --audio-size-bytes 10000
-
-    # Test par paliers
-    python3 stresstest.py --steps "1:30,5:30,10:30"
+3) Test rapide :
+   python3 stresstest.py --rate 5 --duration 60 --audio-file sample.ogg
 """
 
 import argparse
@@ -39,36 +49,69 @@ from datetime import datetime, timezone
 from confluent_kafka import Producer
 
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+TOPIC = "audio.uploaded"
+
+DEFAULT_BOOTSTRAP = "kafka1:9092"
+
+_shutdown = False
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
-log = logging.getLogger("stress-test-producer")
+log = logging.getLogger("pipeline-stresstest")
 
 
-TOPIC = "audio.uploaded"
+# ============================================================
+# CTRL+C
+# ============================================================
 
-_shutdown = False
-
-
-def _handle_sigint(signum, frame):
+def handle_sigint(signum, frame):
     global _shutdown
-    log.info("Arrêt demandé (Ctrl+C), flush en cours...")
-    _shutdown = True
+
+    if not _shutdown:
+        log.warning("Arrêt demandé avec Ctrl+C...")
+        _shutdown = True
 
 
-signal.signal(signal.SIGINT, _handle_sigint)
+signal.signal(signal.SIGINT, handle_sigint)
 
 
-def load_audio_bytes(audio_file: str | None, synthetic_size: int) -> bytes:
+# ============================================================
+# AUDIO
+# ============================================================
+
+def load_audio(audio_file=None, synthetic_size=10000):
+    """
+    Charge un vrai fichier OGG si fourni.
+
+    Sinon génère des bytes synthétiques.
+    ATTENTION :
+    les bytes synthétiques permettent de tester Kafka/MinIO,
+    mais Whisper ne pourra pas forcément les traiter.
+    """
 
     if audio_file:
+        if not os.path.exists(audio_file):
+            raise FileNotFoundError(
+                f"Fichier audio introuvable : {audio_file}"
+            )
+
         with open(audio_file, "rb") as f:
             data = f.read()
 
         log.info(
-            "Audio réel chargé: %s (%d bytes)",
+            "Fichier audio réel chargé : %s (%d bytes)",
             audio_file,
             len(data),
         )
@@ -76,75 +119,177 @@ def load_audio_bytes(audio_file: str | None, synthetic_size: int) -> bytes:
         return data
 
     log.warning(
-        "Aucun fichier audio fourni. Génération de %d bytes synthétiques.",
+        "Aucun fichier audio fourni. "
+        "Génération de %d bytes synthétiques.",
         synthetic_size,
     )
 
     return os.urandom(synthetic_size)
 
 
-def build_message(
-    audio_b64: str,
-    user_pool: list[int],
-    duration_range: tuple,
-) -> dict:
+# ============================================================
+# MESSAGE
+# ============================================================
 
-    user_id = random.choice(user_pool)
-    chat_id = user_id
+def build_message(audio_b64, user_id):
+    """
+    Construit EXACTEMENT le format attendu par
+    kafka_service.publish_audio_uploaded().
+    """
+
+    message_id = str(uuid.uuid4())
 
     return {
-        "message_id": str(uuid.uuid4()),
-        "chat_id": chat_id,
+        "message_id": message_id,
+        "chat_id": user_id,
         "user_id": user_id,
         "telegram_file_id": f"stress-{uuid.uuid4().hex[:12]}",
         "audio_base64": audio_b64,
-        "duration_seconds": random.randint(*duration_range),
+        "duration_seconds": random.randint(3, 30),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
-class Stats:
+# ============================================================
+# DELIVERY REPORT
+# ============================================================
+
+class Statistics:
 
     def __init__(self):
         self.sent = 0
         self.delivered = 0
         self.failed = 0
-        self.start = time.monotonic()
+
+        self.partition_count = {
+            0: 0,
+            1: 0,
+            2: 0,
+        }
+
+        self.start_time = time.monotonic()
 
     def delivery_report(self, err, msg):
 
         if err is not None:
             self.failed += 1
-            log.error("Échec livraison: %s", err)
 
-        else:
-            self.delivered += 1
-
-            log.info(
-                "Kafka -> topic=%s partition=%s offset=%s",
-                msg.topic(),
-                msg.partition(),
-                msg.offset(),
+            log.error(
+                "Kafka delivery FAILED : %s",
+                err,
             )
 
-    def summary(self) -> str:
+            return
 
-        elapsed = time.monotonic() - self.start
+        self.delivered += 1
 
-        rate = (
+        partition = msg.partition()
+
+        if partition not in self.partition_count:
+            self.partition_count[partition] = 0
+
+        self.partition_count[partition] += 1
+
+        log.info(
+            "Kafka -> topic=%s partition=%s offset=%s",
+            msg.topic(),
+            partition,
+            msg.offset(),
+        )
+
+    def summary(self):
+
+        elapsed = time.monotonic() - self.start_time
+
+        effective_rate = (
             self.sent / elapsed
             if elapsed > 0
             else 0
         )
 
         return (
-            f"sent={self.sent} "
-            f"delivered={self.delivered} "
-            f"failed={self.failed} "
-            f"elapsed={elapsed:.1f}s "
-            f"effective_rate={rate:.2f} msg/s"
+            "\n"
+            "=============================\n"
+            "       TEST SUMMARY\n"
+            "=============================\n"
+            f"Sent       : {self.sent}\n"
+            f"Delivered  : {self.delivered}\n"
+            f"Failed     : {self.failed}\n"
+            f"Elapsed    : {elapsed:.1f}s\n"
+            f"Rate       : {effective_rate:.2f} msg/s\n"
+            "\n"
+            "Kafka partitions:\n"
+            f"  partition 0 : {self.partition_count.get(0, 0)}\n"
+            f"  partition 1 : {self.partition_count.get(1, 0)}\n"
+            f"  partition 2 : {self.partition_count.get(2, 0)}\n"
+            "=============================\n"
         )
 
+
+# ============================================================
+# PUBLISH
+# ============================================================
+
+def send_message(
+    producer,
+    stats,
+    csv_writer,
+    audio_b64,
+    user_pool,
+):
+    """
+    Publie un message sur audio.uploaded.
+    """
+
+    user_id = random.choice(user_pool)
+
+    payload = build_message(
+        audio_b64,
+        user_id,
+    )
+
+    message_id = payload["message_id"]
+
+    try:
+
+        producer.produce(
+            TOPIC,
+
+            # IMPORTANT :
+            # même logique que kafka_service.py
+            key=message_id.encode("utf-8"),
+
+            value=json.dumps(payload).encode("utf-8"),
+
+            callback=stats.delivery_report,
+        )
+
+        stats.sent += 1
+
+        csv_writer.writerow([
+            time.time(),
+            message_id,
+            user_id,
+        ])
+
+    except BufferError:
+
+        log.warning(
+            "Buffer Kafka plein. Attente..."
+        )
+
+        producer.poll(1)
+
+        return False
+
+    producer.poll(0)
+
+    return True
+
+
+# ============================================================
+# RATE CONSTANT
+# ============================================================
 
 def run_rate(
     producer,
@@ -152,17 +297,23 @@ def run_rate(
     csv_writer,
     audio_b64,
     user_pool,
-    duration_range,
     rate,
-    duration_seconds,
+    duration,
 ):
+    """
+    Exécute un débit constant.
+    """
 
-    if rate <= 0:
-        raise ValueError("Le rate doit être supérieur à 0.")
+    log.info(
+        "Test : %.2f msg/s pendant %.1f secondes",
+        rate,
+        duration,
+    )
 
     interval = 1.0 / rate
 
-    end_time = time.monotonic() + duration_seconds
+    end_time = time.monotonic() + duration
+
     next_send = time.monotonic()
 
     while (
@@ -175,143 +326,93 @@ def run_rate(
         if now < next_send:
             time.sleep(next_send - now)
 
-        payload = build_message(
+        send_message(
+            producer,
+            stats,
+            csv_writer,
             audio_b64,
             user_pool,
-            duration_range,
         )
-
-        send_ts = time.time()
-
-        try:
-
-            producer.produce(
-                TOPIC,
-                key=str(payload["message_id"]).encode("utf-8"),
-                value=json.dumps(payload).encode("utf-8"),
-                callback=stats.delivery_report,
-            )
-
-            stats.sent += 1
-
-            csv_writer.writerow(
-                [
-                    send_ts,
-                    payload["message_id"],
-                    payload["chat_id"],
-                ]
-            )
-
-        except BufferError:
-
-            log.warning(
-                "Producer queue pleine, poll(1) puis retry"
-            )
-
-            producer.poll(1)
-
-            continue
-
-        producer.poll(0)
 
         next_send += interval
 
     producer.poll(0)
 
 
-def parse_steps(steps_str):
+# ============================================================
+# STEPS
+# ============================================================
 
-    steps = []
+def parse_steps(value):
 
-    for chunk in steps_str.split(","):
+    result = []
 
-        rate_str, dur_str = chunk.split(":")
+    for item in value.split(","):
 
-        rate = float(rate_str)
-        duration = float(dur_str)
+        rate, duration = item.split(":")
 
-        if rate <= 0:
-            raise ValueError(
-                "Le rate doit être supérieur à 0."
+        result.append(
+            (
+                float(rate),
+                float(duration),
             )
-
-        if duration <= 0:
-            raise ValueError(
-                "La durée doit être supérieure à 0."
-            )
-
-        steps.append(
-            (rate, duration)
         )
 
-    return steps
+    return result
 
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
 
     parser = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Test de charge intelligent de toute la pipeline."
     )
 
     parser.add_argument(
         "--bootstrap-servers",
-        default="kafka1:9092",
-        help="Serveurs Kafka",
+        default=DEFAULT_BOOTSTRAP,
     )
 
     parser.add_argument(
         "--audio-file",
         default=None,
-        help="Chemin vers un fichier .ogg réel",
+        help="Vrai fichier .ogg pour tester Whisper.",
     )
 
     parser.add_argument(
         "--audio-size-bytes",
         type=int,
-        default=10_000,
-        help="Taille des données synthétiques",
+        default=10000,
+        help="Taille des bytes synthétiques.",
     )
 
-    # MODIFICATION PRINCIPALE :
-    # Le script possède maintenant un rate par défaut.
     parser.add_argument(
         "--rate",
         type=float,
-        default=1.0,
-        help="Messages/seconde (défaut: 1)",
+        default=None,
+        help="Nombre de messages par seconde.",
     )
 
     parser.add_argument(
         "--duration",
         type=float,
-        default=30.0,
-        help="Durée en secondes (défaut: 30)",
+        default=30,
+        help="Durée du test en secondes.",
     )
 
     parser.add_argument(
         "--steps",
         default=None,
-        help='Paliers, exemple: "1:30,5:30,10:30"',
+        help="Exemple : 1:30,2:30,5:30,10:30",
     )
 
     parser.add_argument(
         "--num-users",
         type=int,
         default=50,
-        help="Nombre d'utilisateurs simulés",
-    )
-
-    parser.add_argument(
-        "--min-duration-s",
-        type=int,
-        default=3,
-    )
-
-    parser.add_argument(
-        "--max-duration-s",
-        type=int,
-        default=30,
     )
 
     parser.add_argument(
@@ -321,25 +422,27 @@ def main():
 
     args = parser.parse_args()
 
-    # Vérifications
+    # --------------------------------------------------------
+    # Vérification arguments
+    # --------------------------------------------------------
 
-    if args.rate <= 0:
-        parser.error("--rate doit être supérieur à 0")
+    if args.rate is None and args.steps is None:
 
-    if args.duration <= 0:
-        parser.error("--duration doit être supérieur à 0")
-
-    if args.num_users <= 0:
-        parser.error("--num-users doit être supérieur à 0")
-
-    if args.min_duration_s > args.max_duration_s:
         parser.error(
-            "--min-duration-s doit être <= --max-duration-s"
+            "Fournissez --rate ou --steps"
         )
 
-    # Audio
+    if args.rate is not None and args.rate <= 0:
 
-    audio_bytes = load_audio_bytes(
+        parser.error(
+            "--rate doit être > 0"
+        )
+
+    # --------------------------------------------------------
+    # Audio
+    # --------------------------------------------------------
+
+    audio_bytes = load_audio(
         args.audio_file,
         args.audio_size_bytes,
     )
@@ -348,26 +451,20 @@ def main():
         audio_bytes
     ).decode("utf-8")
 
+    # --------------------------------------------------------
+    # Users
+    # --------------------------------------------------------
+
     user_pool = list(
-        range(1, args.num_users + 1)
+        range(
+            1,
+            args.num_users + 1
+        )
     )
 
-    duration_range = (
-        args.min_duration_s,
-        args.max_duration_s,
-    )
-
-    # Producer Kafka
-
-    producer = Producer(
-        {
-            "bootstrap.servers": args.bootstrap_servers,
-            "queue.buffering.max.messages": 200_000,
-            "linger.ms": 5,
-        }
-    )
-
-    stats = Stats()
+    # --------------------------------------------------------
+    # Kafka Producer
+    # --------------------------------------------------------
 
     log.info(
         "Kafka bootstrap servers: %s",
@@ -379,49 +476,80 @@ def main():
         TOPIC,
     )
 
-    log.info(
-        "Rate: %.2f message/s",
-        args.rate,
-    )
+    producer = Producer({
+        "bootstrap.servers": args.bootstrap_servers,
 
-    log.info(
-        "Durée: %.1f secondes",
-        args.duration,
-    )
+        # évite que le producer soit rapidement saturé
+        "queue.buffering.max.messages": 200000,
+
+        "linger.ms": 5,
+
+        # améliore la fiabilité
+        "acks": "all",
+    })
+
+    stats = Statistics()
+
+    # --------------------------------------------------------
+    # CSV
+    # --------------------------------------------------------
 
     with open(
         args.log_csv,
         "w",
         newline="",
-    ) as f:
+    ) as csv_file:
 
-        writer = csv.writer(f)
+        writer = csv.writer(csv_file)
 
-        writer.writerow(
-            [
-                "sent_at_epoch",
-                "message_id",
-                "chat_id",
-            ]
-        )
+        writer.writerow([
+            "sent_at",
+            "message_id",
+            "user_id",
+        ])
 
-        if args.steps:
+        # ----------------------------------------------------
+        # MODE RATE
+        # ----------------------------------------------------
 
-            log.info(
-                "Mode paliers: %s",
-                args.steps,
+        if args.rate is not None:
+
+            run_rate(
+                producer,
+                stats,
+                writer,
+                audio_b64,
+                user_pool,
+                args.rate,
+                args.duration,
             )
 
-            for rate, duration in parse_steps(
+        # ----------------------------------------------------
+        # MODE STEPS
+        # ----------------------------------------------------
+
+        else:
+
+            steps = parse_steps(
                 args.steps
-            ):
+            )
+
+            for rate, duration in steps:
 
                 if _shutdown:
                     break
 
                 log.info(
-                    "Palier: %.2f msg/s pendant %.0fs",
+                    "========== NOUVEAU PALIER =========="
+                )
+
+                log.info(
+                    "Rate = %.2f msg/s",
                     rate,
+                )
+
+                log.info(
+                    "Durée = %.1f secondes",
                     duration,
                 )
 
@@ -431,49 +559,73 @@ def main():
                     writer,
                     audio_b64,
                     user_pool,
-                    duration_range,
                     rate,
                     duration,
                 )
 
-                log.info(
-                    "Fin palier -> %s",
-                    stats.summary(),
-                )
-
-        else:
-
-            log.info(
-                "Test simple: %.2f msg/s pendant %.0fs",
-                args.rate,
-                args.duration,
-            )
-
-            run_rate(
-                producer,
-                stats,
-                writer,
-                audio_b64,
-                user_pool,
-                duration_range,
-                args.rate,
-                args.duration,
-            )
-
-    log.info("Flush final...")
-
-    producer.flush(30)
+    # --------------------------------------------------------
+    # FLUSH
+    # --------------------------------------------------------
 
     log.info(
-        "Terminé -> %s",
-        stats.summary(),
+        "Flush final Kafka..."
+    )
+
+    remaining = producer.flush(30)
+
+    if remaining > 0:
+
+        log.warning(
+            "%d messages encore dans la queue Kafka.",
+            remaining,
+        )
+
+    # --------------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------------
+
+    log.info(
+        stats.summary()
     )
 
     log.info(
-        "CSV créé: %s",
+        "CSV créé : %s",
         args.log_csv,
+    )
+
+    log.info(
+        "Le test Kafka est terminé."
+    )
+
+    log.info(
+        "Vérifiez maintenant :"
+    )
+
+    log.info(
+        "  audio.uploaded"
+    )
+
+    log.info(
+        "  MinIO audio-archive"
+    )
+
+    log.info(
+        "  audio.stored"
+    )
+
+    log.info(
+        "  audio.transcribed"
+    )
+
+    log.info(
+        "  transcription.corrected"
+    )
+
+    log.info(
+        "  Elasticsearch / Kibana"
     )
 
 
 if __name__ == "__main__":
     main()
+
