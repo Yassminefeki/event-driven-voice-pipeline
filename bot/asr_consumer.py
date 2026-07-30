@@ -11,6 +11,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+from telegram.error import TelegramError
 
 from config.settings import settings
 from services.kafka_service import kafka_service
@@ -69,16 +70,28 @@ async def run_asr_consumer_loop(
                     ]
                 ])
 
-                sent = await bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "📝 <b>Transcription</b>\n\n"
-                        f"<blockquote>{event['model_transcription']}</blockquote>\n\n"
-                        "Choisissez une action :"
-                    ),
-                    parse_mode="HTML",
-                    reply_markup=keyboard,
-                )
+                try:
+                    sent = await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            "📝 <b>Transcription</b>\n\n"
+                            f"<blockquote>{event['model_transcription']}</blockquote>\n\n"
+                            "Choisissez une action :"
+                        ),
+                        parse_mode="HTML",
+                        reply_markup=keyboard,
+                    )
+                except TelegramError:
+                    # Une erreur Telegram sur CE message (chat introuvable,
+                    # utilisateur ayant bloqué le bot, etc.) ne doit jamais
+                    # interrompre la consommation des messages suivants.
+                    logger.exception(
+                        "message_id=%s: échec d'envoi Telegram à chat_id=%s, "
+                        "message ignoré, la boucle continue",
+                        message_id,
+                        chat_id,
+                    )
+                    continue
 
                 message_id_map[sent.message_id] = message_id
 
