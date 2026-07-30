@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 import json
 import logging
@@ -16,7 +17,9 @@ MINIO_BASE_URL = "http://10.110.188.120:9000"
 BUCKET = "audio-archive"
 MC_ALIAS = "local"  # doit correspondre à `mc alias set local ...`
 
-CONTENT_TYPE_FIX_MAX_RETRIES = 10
+# Correction : on laisse davantage de temps à Kafka Connect
+# pour créer l'objet dans MinIO avant de modifier son Content-Type.
+CONTENT_TYPE_FIX_MAX_RETRIES = 30
 CONTENT_TYPE_FIX_RETRY_DELAY = 1.0  # secondes
 
 consumer_conf = {
@@ -46,38 +49,67 @@ def build_audio_url(object_key: str) -> str:
 
 def fix_content_type(object_key: str) -> bool:
     """
-    Corrige le Content-Type via `mc cp --attr`, plus fiable que la lib
-    Python minio pour remplacer le vrai header HTTP (pas une métadonnée custom).
+    Attend que l'objet existe dans MinIO puis force son Content-Type
+    à audio/ogg.
     """
     mc_path = f"{MC_ALIAS}/{BUCKET}/{object_key}"
 
     for attempt in range(1, CONTENT_TYPE_FIX_MAX_RETRIES + 1):
+
+        # Vérifier que l'objet existe
         stat = subprocess.run(
             ["mc", "stat", mc_path],
-            capture_output=True, text=True
+            capture_output=True,
+            text=True
         )
 
         if stat.returncode != 0:
             log.info(
-                f"Objet {object_key} pas encore prêt (tentative {attempt}/"
-                f"{CONTENT_TYPE_FIX_MAX_RETRIES}): {stat.stderr.strip()}"
+                f"Objet {object_key} pas encore prêt "
+                f"(tentative {attempt}/{CONTENT_TYPE_FIX_MAX_RETRIES})"
             )
             time.sleep(CONTENT_TYPE_FIX_RETRY_DELAY)
             continue
 
+        # Vérifier le Content-Type actuel
+        if "Content-Type: audio/ogg" in stat.stdout:
+            log.info(
+                f"Content-Type déjà correct pour {object_key}: audio/ogg"
+            )
+            return True
+
+        # Corriger le Content-Type
         cp = subprocess.run(
-            ["mc", "cp", "--attr", "Content-Type=audio/ogg", mc_path, mc_path],
-            capture_output=True, text=True
+            [
+                "mc",
+                "cp",
+                "--attr",
+                "Content-Type=audio/ogg",
+                mc_path,
+                mc_path
+            ],
+            capture_output=True,
+            text=True
         )
 
         if cp.returncode == 0:
-            log.info(f"Content-Type corrigé pour {object_key}")
+            log.info(
+                f"Content-Type corrigé pour {object_key}: audio/ogg"
+            )
             return True
-        else:
-            log.error(f"Échec mc cp --attr pour {object_key}: {cp.stderr.strip()}")
-            return False
 
-    log.error(f"Impossible de corriger le Content-Type pour {object_key} après {CONTENT_TYPE_FIX_MAX_RETRIES} tentatives")
+        log.error(
+            f"Échec mc cp --attr pour {object_key}: "
+            f"{cp.stderr.strip()}"
+        )
+
+        time.sleep(CONTENT_TYPE_FIX_RETRY_DELAY)
+
+    log.error(
+        f"Impossible de corriger le Content-Type pour {object_key} "
+        f"après {CONTENT_TYPE_FIX_MAX_RETRIES} tentatives"
+    )
+
     return False
 
 
@@ -85,16 +117,22 @@ def delivery_report(err, msg):
     if err is not None:
         log.error(f"Échec publication audio.stored: {err}")
     else:
-        log.info(f"Publié sur {msg.topic()} [{msg.partition()}]")
+        log.info(
+            f"Publié sur {msg.topic()} "
+            f"[partition={msg.partition()} offset={msg.offset()}]"
+        )
 
 
 def main():
     log.info("Démarrage du publisher audio.stored...")
+
     try:
         while True:
             msg = consumer.poll(1.0)
+
             if msg is None:
                 continue
+
             if msg.error():
                 log.error(f"Erreur consumer: {msg.error()}")
                 continue
@@ -102,7 +140,9 @@ def main():
             try:
                 value = json.loads(msg.value().decode("utf-8"))
             except Exception as e:
-                log.error(f"Message audio.uploaded invalide (JSON): {e}")
+                log.error(
+                    f"Message audio.uploaded invalide (JSON): {e}"
+                )
                 continue
 
             message_id = value.get("message_id")
@@ -110,13 +150,29 @@ def main():
             chat_id = value.get("chat_id")
 
             if not message_id:
-                log.error(f"message_id manquant, message ignoré: {value}")
+                log.error(
+                    f"message_id manquant, message ignoré: {value}"
+                )
                 continue
 
-            object_key = build_object_key(msg.partition(), msg.offset())
+            # Même logique qu'avant :
+            # l'emplacement MinIO dépend de la partition et de l'offset Kafka.
+            object_key = build_object_key(
+                msg.partition(),
+                msg.offset()
+            )
+
             audio_url = build_audio_url(object_key)
 
-            fix_content_type(object_key)
+            # CORRECTION PRINCIPALE :
+            # si le Content-Type n'est pas corrigé,
+            # on ne publie PAS audio.stored.
+            if not fix_content_type(object_key):
+                log.error(
+                    f"Content-Type non corrigé pour {object_key}. "
+                    f"audio.stored ne sera pas publié."
+                )
+                continue
 
             payload = {
                 "message_id": message_id,
@@ -131,11 +187,14 @@ def main():
                 value=json.dumps(payload).encode("utf-8"),
                 callback=delivery_report,
             )
+
             producer.poll(0)
+
             log.info(f"audio.stored -> {payload}")
 
     except KeyboardInterrupt:
         log.info("Arrêt demandé.")
+
     finally:
         producer.flush()
         consumer.close()
@@ -143,3 +202,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
