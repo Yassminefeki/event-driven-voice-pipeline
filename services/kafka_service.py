@@ -1,8 +1,14 @@
+
 """
 Kafka producer/consumer wrapper.
-Enforces one rule above all others: `message_id` is ALWAYS the record key.
-This is what makes ordering per-message and Elasticsearch upserts idempotent.
+
+Règle :
+- Pour audio.uploaded, les nouveaux messages sont envoyés uniquement
+  vers les partitions 0 ou 2.
+- La partition 1 n'est plus utilisée pour les nouveaux vocaux.
+- Les autres topics gardent le comportement Kafka normal.
 """
+
 import json
 import logging
 from kafka import KafkaProducer, KafkaConsumer
@@ -36,61 +42,133 @@ class KafkaService:
         return self._producer
 
     def publish(self, topic: str, message_id: str, payload: dict) -> None:
-        """Publishes and BLOCKS on the send future — never fire-and-forget.
-        A silent failure here was the root cause of a past production bug
-        where the bot logged "success" despite the topic not existing."""
-        future = self.producer.send(topic, key=_key(message_id), value=payload)
-        record_metadata = future.get(timeout=10)  # raises on failure — do not swallow
+        """
+        Publie le message dans Kafka et attend la confirmation.
+
+        Pour audio.uploaded :
+        - partition 0 ou partition 2 uniquement
+        - partition 1 n'est jamais utilisée pour les nouveaux messages
+
+        Pour les autres topics :
+        - Kafka choisit normalement la partition.
+        """
+
+        key = _key(message_id)
+
+        if topic == settings.topic_audio_uploaded:
+            # Utilise uniquement les partitions 0 et 2.
+            # La partition 1 est volontairement exclue.
+            partition = 0 if hash(message_id) % 2 == 0 else 2
+
+            future = self.producer.send(
+                topic,
+                key=key,
+                value=payload,
+                partition=partition,
+            )
+        else:
+            # Comportement normal pour les autres topics
+            future = self.producer.send(
+                topic,
+                key=key,
+                value=payload,
+            )
+
+        # Attend réellement la confirmation de Kafka
+        record_metadata = future.get(timeout=10)
+
         logger.info(
             "Published message_id=%s to %s [partition=%s offset=%s]",
-            message_id, topic, record_metadata.partition, record_metadata.offset,
+            message_id,
+            topic,
+            record_metadata.partition,
+            record_metadata.offset,
         )
 
-    def publish_audio_uploaded(self, message_id: str, chat_id: int, user_id: int,
-                                telegram_file_id: str, audio_base64: str,
-                                duration_seconds: int, timestamp: str) -> None:
-        self.publish(settings.topic_audio_uploaded, message_id, {
-            "message_id": message_id,
-            "chat_id": chat_id,
-            "user_id": user_id,
-            "telegram_file_id": telegram_file_id,
-            "audio_base64": audio_base64,
-            "duration_seconds": duration_seconds,
-            "timestamp": timestamp,
-        })
+    def publish_audio_uploaded(
+        self,
+        message_id: str,
+        chat_id: int,
+        user_id: int,
+        telegram_file_id: str,
+        audio_base64: str,
+        duration_seconds: int,
+        timestamp: str,
+    ) -> None:
 
-    def publish_audio_transcribed(self, message_id: str, chat_id: int, user_id: int,
-                                   audio_url: str, model_transcription: str,
-                                   asr_model_version: str, confidence_score: float,
-                                   processing_time_ms: int, timestamp: str) -> None:
-        self.publish(settings.topic_audio_transcribed, message_id, {
-            "message_id": message_id,
-            "chat_id": chat_id,
-            "user_id": user_id,
-            "audio_url": audio_url,
-            "model_transcription": model_transcription,
-            "asr_model_version": asr_model_version,
-            "confidence_score": confidence_score,
-            "processing_time_ms": processing_time_ms,
-            "timestamp": timestamp,
-        })
+        self.publish(
+            settings.topic_audio_uploaded,
+            message_id,
+            {
+                "message_id": message_id,
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "telegram_file_id": telegram_file_id,
+                "audio_base64": audio_base64,
+                "duration_seconds": duration_seconds,
+                "timestamp": timestamp,
+            },
+        )
 
-    def publish_transcription_corrected(self, message_id: str, chat_id: int, user_id: int,
-                                         audio_url: str, model_transcription: str,
-                                         user_correction: str, wer: float, cer: float,
-                                         is_edited: bool, timestamp: str) -> None:
-        self.publish(settings.topic_transcription_corrected, message_id, {
-            "message_id": message_id,
-            "chat_id": chat_id,
-            "user_id": user_id,
-            "audio_url": audio_url,
-            "model_transcription": model_transcription,
-            "user_correction": user_correction,
-            "wer": wer,
-            "cer": cer,
-            "is_edited": is_edited,
-            "timestamp": timestamp,
-        })
+    def publish_audio_transcribed(
+        self,
+        message_id: str,
+        chat_id: int,
+        user_id: int,
+        audio_url: str,
+        model_transcription: str,
+        asr_model_version: str,
+        confidence_score: float,
+        processing_time_ms: int,
+        timestamp: str,
+    ) -> None:
+
+        self.publish(
+            settings.topic_audio_transcribed,
+            message_id,
+            {
+                "message_id": message_id,
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "audio_url": audio_url,
+                "model_transcription": model_transcription,
+                "asr_model_version": asr_model_version,
+                "confidence_score": confidence_score,
+                "processing_time_ms": processing_time_ms,
+                "timestamp": timestamp,
+            },
+        )
+
+    def publish_transcription_corrected(
+        self,
+        message_id: str,
+        chat_id: int,
+        user_id: int,
+        audio_url: str,
+        model_transcription: str,
+        user_correction: str,
+        wer: float,
+        cer: float,
+        is_edited: bool,
+        timestamp: str,
+    ) -> None:
+
+        self.publish(
+            settings.topic_transcription_corrected,
+            message_id,
+            {
+                "message_id": message_id,
+                "chat_id": chat_id,
+                "user_id": user_id,
+                "audio_url": audio_url,
+                "model_transcription": model_transcription,
+                "user_correction": user_correction,
+                "wer": wer,
+                "cer": cer,
+                "is_edited": is_edited,
+                "timestamp": timestamp,
+            },
+        )
 
     @staticmethod
     def make_consumer(topic: str, group_id: str) -> KafkaConsumer:
@@ -106,3 +184,4 @@ class KafkaService:
 
 
 kafka_service = KafkaService()
+
