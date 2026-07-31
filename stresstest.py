@@ -33,6 +33,12 @@ Kafka Connect ES Sink) : il suppose qu'ils tournent déjà. Il a trois modes :
      interroge Elasticsearch pour vérifier que 100% des messages envoyés
      sont retrouvés (indexés OU en DLQ), avec mesure de latence e2e.
 
+     Avec le worker ASR devenu concurrent par lot (poll() par batch +
+     ThreadPoolExecutor, voir ASR_WORKER_CONCURRENCY / ASR_WORKER_BATCH_SIZE),
+     ce mode permet enfin d'observer une vraie charge concurrente sur
+     Whisper à travers tout le pipeline, et pas seulement en direct
+     (mode whisper-load) ou en série.
+
 Usage :
     # Étape 0 (recommandé) : mesurer la vraie capacité de concurrence de
     # Whisper, sans Kafka, pour calibrer ASR_WORKER_CONCURRENCY
@@ -42,7 +48,8 @@ Usage :
     python stresstest.py mock-whisper --port 8090 --fault-rate 0.3
 
     # (pointer WHISPER_ENDPOINT=http://localhost:8090/transcribe sur le
-    #  worker réel et le redémarrer, avant l'étape suivante)
+    #  worker réel, régler ASR_WORKER_CONCURRENCY/ASR_WORKER_BATCH_SIZE,
+    #  et le redémarrer, avant l'étape suivante)
 
     # Terminal 2 : injecter 500 messages à 20 msg/s
     python stresstest.py run --count 500 --rate 20 --audio-file sample.ogg
