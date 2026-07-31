@@ -316,17 +316,18 @@ def cmd_smart_run(args: argparse.Namespace):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Test de charge intelligent de pipeline")
-    subparsers = parser.add_parser_subparsers(dest="command", required=True)
+    def main():
+        parser = argparse.ArgumentParser(description="Test de charge intelligent de pipeline")
+        subparsers = parser.add_subparsers(dest="command", required=True) # ✅ Correction
 
-    p_smart = subparsers.add_parser("smart-run", help="Lance la simulation d'utilisateurs simultanés ordonnée")
-    p_smart.add_argument("--users", type=int, default=5, help="Nombre d'utilisateurs virtuels simultanés (Threads)")
-    p_smart.add_argument("--total", type=int, default=20, help="Nombre total de vocaux à envoyer")
-    p_smart.add_argument("--audio-file", type=str, required=True, help="Chemin vers le fichier sample.ogg")
-    p_smart.add_argument("--asr-timeout", type=float, default=45.0, help="Timeout max attente ASR par vocal (s)")
-    p_smart.add_argument("--es-wait-timeout", type=float, default=60.0, help="Timeout attente ES finale (s)")
-    p_smart.add_argument("--s3-wait-retries", type=int, default=5, help="Tentatives de vérification S3 (1 retry/sec)")
-    p_smart.set_defaults(func=cmd_smart_run)
+        p_smart = subparsers.add_parser("smart-run", help="Lance la simulation d'utilisateurs simultanés ordonnée")
+        p_smart.add_argument("--users", type=int, default=5, help="Nombre d'utilisateurs virtuels simultanés (Threads)")
+        p_smart.add_argument("--total", type=int, default=20, help="Nombre total de vocaux à envoyer")
+        p_smart.add_argument("--audio-file", type=str, required=True, help="Chemin vers le fichier sample.ogg")
+        p_smart.add_argument("--asr-timeout", type=float, default=45.0, help="Timeout max attente ASR par vocal (s)")
+        p_smart.add_argument("--es-wait-timeout", type=float, default=60.0, help="Timeout attente ES finale (s)")
+        p_smart.add_argument("--s3-wait-retries", type=int, default=5, help="Tentatives de vérification S3 (1 retry/sec)")
+        p_smart.set_defaults(func=cmd_smart_run)
 
     args = parser.parse_args()
     args.func(args)
