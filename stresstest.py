@@ -187,20 +187,14 @@ def _verify_elasticsearch_wildcard(stats: SmartRunStats, expected_ids: set, time
 
 
 def cmd_smart_run(args: argparse.Namespace):
-    if not args.audio_file:
-        logger.error("Veuillez fournir --audio-file sample.ogg")
-        sys.exit(1)
-
-    with open(args.audio_file, "rb") as f:
-        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
-
-    stats = SmartRunStats()
-    stop_event = threading.Event()
-
-    t_transcribed = threading.Thread(target=_transcribed_listener, args=(stats, stop_event), daemon=True)
-    t_dlq = threading.Thread(target=_dlq_listener, args=(stats, stop_event), daemon=True)
-    t_transcribed.start()
-    t_dlq.start()
+    # Attente du dépilage complet par ASR en mode burst
+    if getattr(args, "burst", False):
+        logger.info(f"⏳ Attente du traitement du backlog par Whisper ASR (Timeout: {args.asr_timeout}s)...")
+        drain_deadline = time.monotonic() + args.asr_timeout
+        while len(stats.transcribed_events) < len(sent_ids) and time.monotonic() < drain_deadline:
+            time.sleep(1.0)
+            if len(stats.transcribed_events) % 50 == 0 and len(stats.transcribed_events) > 0:
+                logger.info(f"Progression ASR : {len(stats.transcribed_events)} / {len(sent_ids)} transcrits...")
 
     logger.info("🔥 === DÉMARRAGE DU TEST DE CHARGE ===")
     logger.info(f"Threads Simultanés : {args.users} | Total Messages : {args.total}")
