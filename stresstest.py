@@ -57,7 +57,6 @@ class SmartRunStats:
 def _transcribed_listener(stats: SmartRunStats, stop_event: threading.Event):
     from services.kafka_service import kafka_service
 
-    # Force auto_offset_reset='latest' pour ignorer l'historique du topic
     consumer = kafka_service.make_consumer(
         "audio.transcribed",
         group_id=f"stresstest-listener-{uuid.uuid4()}",
@@ -69,12 +68,26 @@ def _transcribed_listener(stats: SmartRunStats, stop_event: threading.Event):
         records = consumer.poll(timeout_ms=500)
         for tp, msgs in records.items():
             for record in msgs:
-                if record.value:
-                    mid = record.value.get("message_id")
-                    # On ne comptabilise que les messages de cette session
+                val = record.value
+                if not val:
+                    continue
+                
+                # Extraction ultra-flexible de l'UUID
+                mid = None
+                if isinstance(val, dict):
+                    mid = val.get("message_id") or val.get("id") or val.get("payload", {}).get("message_id")
+                elif isinstance(val, str):
+                    try:
+                        parsed = json.loads(val)
+                        mid = parsed.get("message_id") or parsed.get("id")
+                    except Exception:
+                        pass
+
+                if mid:
+                    mid = str(mid)
                     with stats.lock:
                         if mid in stats.sent_at:
-                            stats.register_transcription(record.value)
+                            stats.register_transcription(val)
 def _dlq_listener(stats: SmartRunStats, stop_event: threading.Event):
     from services.kafka_service import kafka_service, TOPIC_AUDIO_UPLOADED_DLQ
 
