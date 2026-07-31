@@ -12,7 +12,7 @@ finir soit indexé dans Elasticsearch, soit dans le topic audio.uploaded.dlq,
 mais jamais disparaître silencieusement.
 
 Ce script NE remplace PAS les composants réels (ASR Worker, publisher S3,
-Kafka Connect ES Sink) : il suppose qu'ils tournent déjà. Il a deux modes :
+Kafka Connect ES Sink) : il suppose qu'ils tournent déjà. Il a trois modes :
 
   1) mock-whisper : sert un faux serveur Whisper HTTP avec injection de
      pannes contrôlées (latence, timeouts, 500, 429), pour reproduire le
@@ -20,13 +20,24 @@ Kafka Connect ES Sink) : il suppose qu'ils tournent déjà. Il a deux modes :
      -> Pointer WHISPER_ENDPOINT du worker réel vers ce serveur avant de
         lancer le test, puis (re)démarrer le worker.
 
-  2) run : génère la charge (audio.uploaded), consomme audio.transcribed
+  2) whisper-load : envoie une charge réelle CONCURRENTE directement vers
+     l'endpoint Whisper réel, SANS passer par Kafka ni le worker. Isole la
+     vraie capacité de concurrence du pod Whisper (throughput, latence,
+     point de rupture) indépendamment de tout goulot du pipeline (nombre
+     de partitions, worker mono-thread, etc). À utiliser AVANT le mode
+     `run` pour connaître la valeur à donner à ASR_WORKER_CONCURRENCY.
+
+  3) run : génère la charge (audio.uploaded), consomme audio.transcribed
      pour auto-valider (publie transcription.corrected), consomme
      audio.uploaded.dlq pour comptabiliser les échecs définitifs, puis
      interroge Elasticsearch pour vérifier que 100% des messages envoyés
      sont retrouvés (indexés OU en DLQ), avec mesure de latence e2e.
 
 Usage :
+    # Étape 0 (recommandé) : mesurer la vraie capacité de concurrence de
+    # Whisper, sans Kafka, pour calibrer ASR_WORKER_CONCURRENCY
+    python stresstest.py whisper-load --count 200 --concurrency 20 --audio-file sample.ogg
+
     # Terminal 1 : faux Whisper à 30% de pannes (mix timeout / 500)
     python stresstest.py mock-whisper --port 8090 --fault-rate 0.3
 
@@ -132,17 +143,8 @@ def cmd_mock_whisper(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mode 2 : génération de charge + vérification end-to-end
+# Utilitaire partagé : charger un échantillon audio
 # ---------------------------------------------------------------------------
-
-@dataclass
-class RunStats:
-    sent_at: dict = field(default_factory=dict)          # message_id -> send timestamp (monotonic)
-    transcribed_at: dict = field(default_factory=dict)    # message_id -> receive timestamp
-    dlq_ids: set = field(default_factory=set)
-    indexed_ids: set = field(default_factory=set)
-    lock: threading.Lock = field(default_factory=threading.Lock)
-
 
 def _load_audio_bytes(args: argparse.Namespace) -> bytes:
     if args.audio_file:
@@ -175,6 +177,140 @@ def _load_audio_bytes(args: argparse.Namespace) -> bytes:
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Mode 2 : charge réelle concurrente DIRECTE contre Whisper (sans Kafka)
+# ---------------------------------------------------------------------------
+
+def cmd_whisper_load(args: argparse.Namespace) -> None:
+    """
+    Envoie N requêtes réelles en concurrence directe vers WHISPER_ENDPOINT,
+    sans passer par Kafka/le worker. Isole la capacité réelle de concurrence
+    du pod Whisper, indépendamment des goulots du pipeline (partitions,
+    worker mono-thread). Sert à calibrer ASR_WORKER_CONCURRENCY avant de
+    lancer le mode `run` end-to-end.
+    """
+    import requests
+    from config.settings import settings
+
+    audio_bytes = _load_audio_bytes(args)
+    endpoint = args.endpoint or settings.whisper_endpoint
+
+    if not endpoint:
+        logger.error(
+            "Aucun endpoint Whisper fourni : passez --endpoint ou définissez "
+            "WHISPER_ENDPOINT dans .env"
+        )
+        sys.exit(1)
+
+    logger.info(
+        "Envoi de %d requêtes réelles vers %s avec %d en concurrence",
+        args.count, endpoint, args.concurrency
+    )
+
+    results = []
+    lock = threading.Lock()
+
+    def send_one(i: int):
+        start = time.monotonic()
+        try:
+            resp = requests.post(
+                endpoint,
+                files={"file": (f"stresstest-{i}.ogg", audio_bytes)},
+                timeout=args.timeout,
+            )
+            elapsed_ms = (time.monotonic() - start) * 1000
+            with lock:
+                results.append({
+                    "i": i,
+                    "status": resp.status_code,
+                    "elapsed_ms": elapsed_ms,
+                    "error": None if resp.status_code == 200 else f"http_{resp.status_code}",
+                })
+        except requests.exceptions.Timeout:
+            elapsed_ms = (time.monotonic() - start) * 1000
+            with lock:
+                results.append({
+                    "i": i,
+                    "status": None,
+                    "elapsed_ms": elapsed_ms,
+                    "error": "timeout",
+                })
+        except Exception as exc:
+            elapsed_ms = (time.monotonic() - start) * 1000
+            with lock:
+                results.append({
+                    "i": i,
+                    "status": None,
+                    "elapsed_ms": elapsed_ms,
+                    "error": str(exc),
+                })
+
+    t0 = time.monotonic()
+    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+        list(pool.map(send_one, range(args.count)))
+    total_duration = time.monotonic() - t0
+
+    ok = [r for r in results if r["status"] == 200]
+    errors = [r for r in results if r["error"]]
+    latencies = [r["elapsed_ms"] for r in ok]
+
+    error_breakdown: dict = {}
+    for r in errors:
+        key = r["error"]
+        error_breakdown[key] = error_breakdown.get(key, 0) + 1
+
+    report = {
+        "endpoint": endpoint,
+        "concurrency": args.concurrency,
+        "count": args.count,
+        "total_duration_s": round(total_duration, 1),
+        "throughput_req_per_s": round(args.count / total_duration, 2) if total_duration > 0 else None,
+        "success": len(ok),
+        "errors": len(errors),
+        "error_breakdown": error_breakdown,
+        "latency_ms_p50": round(statistics.median(latencies), 1) if latencies else None,
+        "latency_ms_p95": (
+            round(statistics.quantiles(latencies, n=20)[18], 1)
+            if len(latencies) >= 20 else None
+        ),
+        "latency_ms_max": round(max(latencies), 1) if latencies else None,
+    }
+
+    print("\n" + "=" * 60)
+    print(f"CHARGE RÉELLE CONCURRENTE — Whisper (concurrency={args.concurrency})")
+    print("=" * 60)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    print("=" * 60)
+
+    if errors:
+        print(
+            f"\n⚠️  {len(errors)}/{args.count} requête(s) en échec à ce niveau de "
+            f"concurrence ({args.concurrency}). Détail: {error_breakdown}"
+        )
+    else:
+        print(
+            f"\n✅ {len(ok)}/{args.count} requêtes réussies à concurrence={args.concurrency}. "
+            f"Vous pouvez tenter une concurrence plus élevée pour trouver le point de rupture."
+        )
+
+    with open(args.report, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    logger.info("Rapport écrit dans %s", args.report)
+
+
+# ---------------------------------------------------------------------------
+# Mode 3 : génération de charge end-to-end + vérification
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RunStats:
+    sent_at: dict = field(default_factory=dict)          # message_id -> send timestamp (monotonic)
+    transcribed_at: dict = field(default_factory=dict)    # message_id -> receive timestamp
+    dlq_ids: set = field(default_factory=set)
+    indexed_ids: set = field(default_factory=set)
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 def _producer_worker(audio_b64: str, rate: float, count: int, stats: RunStats) -> None:
@@ -416,6 +552,18 @@ def main() -> None:
     p_mock.add_argument("--fault-mode", choices=["timeout", "http500", "both"], default="both")
     p_mock.add_argument("--slow-seconds", type=float, default=65.0, help="Durée du blocage simulé en mode timeout")
     p_mock.set_defaults(func=cmd_mock_whisper)
+
+    p_wload = sub.add_parser(
+        "whisper-load",
+        help="Charge réelle concurrente DIRECTE vers Whisper (sans Kafka) — calibre ASR_WORKER_CONCURRENCY",
+    )
+    p_wload.add_argument("--endpoint", type=str, default=None, help="Défaut: WHISPER_ENDPOINT de .env")
+    p_wload.add_argument("--count", type=int, default=100, help="Nombre total de requêtes à envoyer")
+    p_wload.add_argument("--concurrency", type=int, default=10, help="Nombre de requêtes réellement en vol simultanément")
+    p_wload.add_argument("--timeout", type=float, default=60.0)
+    p_wload.add_argument("--audio-file", type=str, default=None)
+    p_wload.add_argument("--report", type=str, default="whisper_load_report.json")
+    p_wload.set_defaults(func=cmd_whisper_load)
 
     p_run = sub.add_parser("run", help="Génère la charge et vérifie l'absence de perte end-to-end")
     p_run.add_argument("--count", type=int, default=200, help="Nombre de messages à envoyer")
