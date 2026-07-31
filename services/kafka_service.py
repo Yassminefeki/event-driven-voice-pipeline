@@ -1,4 +1,3 @@
-
 """
 Kafka producer/consumer wrapper.
 
@@ -7,15 +6,33 @@ Règle :
   vers les partitions 0 ou 2.
 - La partition 1 n'est plus utilisée pour les nouveaux vocaux.
 - Les autres topics gardent le comportement Kafka normal.
+
+CORRECTIF (perte de messages sous forte charge) :
+- Les consumers "critiques" (traitement métier) utilisent désormais
+  enable_auto_commit=False. L'offset n'est commité par l'appelant
+  qu'après succès du traitement (voir whisper_worker.py), ou après
+  publication dans le topic DLQ dédié en cas d'échec définitif.
+- Avant ce correctif, enable_auto_commit=True committait l'offset sur
+  une base temporelle, indépendamment du succès du traitement : un
+  message qui échouait (ex. timeout Whisper sous forte charge) était
+  quand même marqué comme "lu" et donc perdu définitivement.
 """
 
 import json
 import logging
 from kafka import KafkaProducer, KafkaConsumer
+from kafka.structs import TopicPartition, OffsetAndMetadata
 
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+# Topic de dead-letter pour audio.uploaded : si le traitement échoue de façon
+# définitive (retries épuisés), le message y est publié tel quel plutôt que
+# d'être perdu silencieusement. Peut être surchargé via settings si présent.
+TOPIC_AUDIO_UPLOADED_DLQ = getattr(
+    settings, "topic_audio_uploaded_dlq", "audio.uploaded.dlq"
+)
 
 
 def _serialize(value: dict) -> bytes:
@@ -170,8 +187,41 @@ class KafkaService:
             },
         )
 
+    def publish_audio_uploaded_dlq(self, original_event: dict, error: str) -> None:
+        """
+        Publie un message audio.uploaded qui a définitivement échoué
+        (retries épuisés côté worker) vers le topic dead-letter, afin
+        de ne jamais le perdre silencieusement. Le message garde son
+        message_id pour rester traçable / rejouable manuellement.
+        """
+        message_id = original_event.get("message_id", "unknown")
+
+        payload = dict(original_event)
+        payload["dlq_error"] = error
+
+        self.publish(TOPIC_AUDIO_UPLOADED_DLQ, message_id, payload)
+
+        logger.error(
+            "message_id=%s: envoyé en DLQ (%s) après échec définitif",
+            message_id, TOPIC_AUDIO_UPLOADED_DLQ
+        )
+
     @staticmethod
-    def make_consumer(topic: str, group_id: str) -> KafkaConsumer:
+    def make_consumer(
+        topic: str,
+        group_id: str,
+        enable_auto_commit: bool = False,
+    ) -> KafkaConsumer:
+        """
+        enable_auto_commit=False par défaut : l'appelant DOIT committer
+        explicitement via commit_offset() (ou consumer.commit()) une fois
+        le traitement terminé avec succès. Ne pas committer un message qui
+        a échoué -> il sera re-livré au prochain poll (at-least-once).
+
+        Les consumers non critiques (ex. simple cache de lecture, sans
+        effet de bord métier à protéger) peuvent explicitement repasser
+        à enable_auto_commit=True s'ils le souhaitent.
+        """
         return KafkaConsumer(
             topic,
             bootstrap_servers=list(settings.kafka_bootstrap_servers),
@@ -179,9 +229,19 @@ class KafkaService:
             key_deserializer=lambda k: k.decode("utf-8") if k else None,
             value_deserializer=lambda v: json.loads(v.decode("utf-8")),
             auto_offset_reset="earliest",
-            enable_auto_commit=True,
+            enable_auto_commit=enable_auto_commit,
+            max_poll_interval_ms=600000,  # marge de sécurité si Whisper est lent sous charge
         )
+
+    @staticmethod
+    def commit_offset(consumer: KafkaConsumer, record) -> None:
+        """
+        Committe explicitement l'offset du message donné (offset+1, comme
+        l'exige l'API Kafka) sur sa partition, une fois le traitement (ou
+        l'envoi en DLQ) terminé avec succès.
+        """
+        tp = TopicPartition(record.topic, record.partition)
+        consumer.commit({tp: OffsetAndMetadata(record.offset + 1, None)})
 
 
 kafka_service = KafkaService()
-

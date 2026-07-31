@@ -1,631 +1,433 @@
-
 #!/usr/bin/env python3
 """
-stresstest.py
-=============
-Test de charge intelligent de toute la pipeline :
+stresstest.py — Test de charge end-to-end de la pipeline.
 
-Telegram/Bot (simulé)
-        ↓
-Kafka audio.uploaded
-        ↓
-Kafka Connect → MinIO
-        ↓
-publisher.py → audio.stored
-        ↓
-Whisper Worker → audio.transcribed
-        ↓
-correction → transcription.corrected
-        ↓
-Kafka Connect → Elasticsearch
+audio.uploaded -> ASR Worker -> audio.transcribed
+              -> (auto-validation simulée ici)   -> transcription.corrected
+              -> Elasticsearch Sink Connector     -> index Elasticsearch
 
-Le script ne modifie PAS la partition Kafka.
-Kafka choisit automatiquement la partition en fonction de la clé message_id.
+Objectif : injecter du trafic (y compris en simulant un Whisper lent/en
+échec) et PROUVER qu'aucun message n'est perdu : chaque message envoyé doit
+finir soit indexé dans Elasticsearch, soit dans le topic audio.uploaded.dlq,
+mais jamais disparaître silencieusement.
 
-Exemples :
+Ce script NE remplace PAS les composants réels (ASR Worker, publisher S3,
+Kafka Connect ES Sink) : il suppose qu'ils tournent déjà. Il a deux modes :
 
-1) Test simple :
-   python3 stresstest.py --rate 1 --duration 30 --audio-file sample.ogg
+  1) mock-whisper : sert un faux serveur Whisper HTTP avec injection de
+     pannes contrôlées (latence, timeouts, 500, 429), pour reproduire le
+     bug "Whisper bloque sous forte charge" de façon reproductible.
+     -> Pointer WHISPER_ENDPOINT du worker réel vers ce serveur avant de
+        lancer le test, puis (re)démarrer le worker.
 
-2) Test progressif :
-   python3 stresstest.py --steps "1:30,2:30,5:30,10:30" --audio-file sample.ogg
+  2) run : génère la charge (audio.uploaded), consomme audio.transcribed
+     pour auto-valider (publie transcription.corrected), consomme
+     audio.uploaded.dlq pour comptabiliser les échecs définitifs, puis
+     interroge Elasticsearch pour vérifier que 100% des messages envoyés
+     sont retrouvés (indexés OU en DLQ), avec mesure de latence e2e.
 
-3) Test rapide :
-   python3 stresstest.py --rate 5 --duration 60 --audio-file sample.ogg
+Usage :
+    # Terminal 1 : faux Whisper à 30% de pannes (mix timeout / 500)
+    python stresstest.py mock-whisper --port 8090 --fault-rate 0.3
+
+    # (pointer WHISPER_ENDPOINT=http://localhost:8090/transcribe sur le
+    #  worker réel et le redémarrer, avant l'étape suivante)
+
+    # Terminal 2 : injecter 500 messages à 20 msg/s
+    python stresstest.py run --count 500 --rate 20 --audio-file sample.ogg
 """
 
 import argparse
 import base64
-import csv
 import json
 import logging
-import os
 import random
-import signal
+import statistics
+import sys
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-
-from confluent_kafka import Producer
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-TOPIC = "audio.uploaded"
-
-DEFAULT_BOOTSTRAP = "kafka1:9092"
-
-_shutdown = False
-
-
-# ============================================================
-# LOGGING
-# ============================================================
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
-
-log = logging.getLogger("pipeline-stresstest")
-
-
-# ============================================================
-# CTRL+C
-# ============================================================
-
-def handle_sigint(signum, frame):
-    global _shutdown
-
-    if not _shutdown:
-        log.warning("Arrêt demandé avec Ctrl+C...")
-        _shutdown = True
+logger = logging.getLogger("stresstest")
 
 
-signal.signal(signal.SIGINT, handle_sigint)
+# ---------------------------------------------------------------------------
+# Mode 1 : faux serveur Whisper avec injection de pannes
+# ---------------------------------------------------------------------------
+
+def cmd_mock_whisper(args: argparse.Namespace) -> None:
+    fault_rate = args.fault_rate
+    fault_mode = args.fault_mode  # timeout | http500 | both
+    slow_seconds = args.slow_seconds
+
+    class MockWhisperHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *a):
+            logger.info("mock-whisper: %s", fmt % a)
+
+        def do_POST(self):
+            # Consomme le corps (le fichier audio envoyé par le worker),
+            # peu importe son contenu pour ce test de charge.
+            length = int(self.headers.get("Content-Length", 0))
+            _ = self.rfile.read(length)
+
+            roll = random.random()
+
+            if roll < fault_rate:
+                mode = fault_mode
+                if mode == "both":
+                    mode = random.choice(["timeout", "http500"])
+
+                if mode == "timeout":
+                    logger.info("mock-whisper: simulate TIMEOUT (sleep %.1fs, no response)", slow_seconds)
+                    time.sleep(slow_seconds)
+                    # Ne répond jamais -> le client requests finira par timeout lui-même
+                    self.connection.close()
+                    return
+
+                if mode == "http500":
+                    logger.info("mock-whisper: simulate HTTP 500")
+                    body = json.dumps({"error": "simulated overload"}).encode()
+                    self.send_response(500)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+            # Cas nominal : réponse correcte, avec une petite latence réaliste
+            time.sleep(random.uniform(0.05, 0.3))
+            body = json.dumps({
+                "text": "ceci est une transcription simulée",
+                "model": "whisper-mock",
+                "confidence": 0.95,
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("0.0.0.0", args.port), MockWhisperHandler)
+    logger.info(
+        "Mock Whisper démarré sur http://0.0.0.0:%d (fault_rate=%.0f%%, mode=%s)",
+        args.port, fault_rate * 100, fault_mode
+    )
+    logger.info(
+        "-> pointer WHISPER_ENDPOINT du worker réel vers "
+        "http://<host>:%d puis redémarrer le worker avant `run`.",
+        args.port
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Arrêt du mock Whisper.")
 
 
-# ============================================================
-# AUDIO
-# ============================================================
+# ---------------------------------------------------------------------------
+# Mode 2 : génération de charge + vérification end-to-end
+# ---------------------------------------------------------------------------
 
-def load_audio(audio_file=None, synthetic_size=10000):
-    """
-    Charge un vrai fichier OGG si fourni.
+@dataclass
+class RunStats:
+    sent_at: dict = field(default_factory=dict)          # message_id -> send timestamp (monotonic)
+    transcribed_at: dict = field(default_factory=dict)    # message_id -> receive timestamp
+    dlq_ids: set = field(default_factory=set)
+    indexed_ids: set = field(default_factory=set)
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
-    Sinon génère des bytes synthétiques.
-    ATTENTION :
-    les bytes synthétiques permettent de tester Kafka/MinIO,
-    mais Whisper ne pourra pas forcément les traiter.
-    """
 
-    if audio_file:
-        if not os.path.exists(audio_file):
-            raise FileNotFoundError(
-                f"Fichier audio introuvable : {audio_file}"
-            )
+def _load_audio_bytes(args: argparse.Namespace) -> bytes:
+    if args.audio_file:
+        with open(args.audio_file, "rb") as f:
+            return f.read()
 
-        with open(audio_file, "rb") as f:
-            data = f.read()
+    # Pas de fichier fourni : tente de générer un court silence via ffmpeg.
+    import subprocess
+    import tempfile
+    import os
 
-        log.info(
-            "Fichier audio réel chargé : %s (%d bytes)",
-            audio_file,
-            len(data),
+    tmp_path = tempfile.mktemp(suffix=".ogg")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+                "-t", "1", "-c:a", "libopus", tmp_path,
+            ],
+            check=True, capture_output=True,
         )
+        with open(tmp_path, "rb") as f:
+            return f.read()
+    except Exception as exc:
+        logger.error(
+            "Impossible de générer un audio de test via ffmpeg (%s). "
+            "Fournissez un vrai échantillon avec --audio-file sample.ogg",
+            exc
+        )
+        sys.exit(1)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
-        return data
 
-    log.warning(
-        "Aucun fichier audio fourni. "
-        "Génération de %d bytes synthétiques.",
-        synthetic_size,
+def _producer_worker(audio_b64: str, rate: float, count: int, stats: RunStats) -> None:
+    """Publie `count` messages audio.uploaded à un débit cible de `rate` msg/s."""
+    from services.kafka_service import kafka_service
+
+    interval = 1.0 / rate if rate > 0 else 0.0
+
+    def send_one(i: int):
+        message_id = str(uuid.uuid4())
+        with stats.lock:
+            stats.sent_at[message_id] = time.monotonic()
+
+        kafka_service.publish_audio_uploaded(
+            message_id=message_id,
+            chat_id=-1,                       # chat_id factice, réservé au test de charge
+            user_id=-1,
+            telegram_file_id=f"stresstest-{i}",
+            audio_base64=audio_b64,
+            duration_seconds=1,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+        return message_id
+
+    # Publication en léger parallélisme pour tenir le débit cible sans que
+    # la latence du broker ne ralentisse artificiellement l'injection.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = []
+        start = time.monotonic()
+        for i in range(count):
+            futures.append(pool.submit(send_one, i))
+            target_time = start + i * interval
+            sleep_for = target_time - time.monotonic()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+
+        for fut in futures:
+            fut.result()
+
+    logger.info("Producteur: %d messages audio.uploaded envoyés", count)
+
+
+def _transcribed_consumer(stats: RunStats, stop_event: threading.Event) -> None:
+    """
+    Consomme audio.transcribed et simule immédiatement l'action "Valider"
+    de l'utilisateur (comme le ferait le bot Telegram), afin que le message
+    poursuive sa route jusqu'à transcription.corrected -> Elasticsearch.
+    """
+    from services.kafka_service import kafka_service
+
+    consumer = kafka_service.make_consumer(
+        "audio.transcribed",
+        group_id=f"stresstest-transcribed-{uuid.uuid4()}",
+        enable_auto_commit=True,
     )
 
-    return os.urandom(synthetic_size)
+    for record in consumer:
+        if stop_event.is_set():
+            break
+
+        event = record.value
+        message_id = event["message_id"]
+
+        with stats.lock:
+            stats.transcribed_at[message_id] = time.monotonic()
+
+        # Auto-validation (équivalent du clic "✅ Valider" côté bot)
+        kafka_service.publish_transcription_corrected(
+            message_id=message_id,
+            chat_id=event["chat_id"],
+            user_id=event["user_id"],
+            audio_url=event.get("audio_url", ""),
+            model_transcription=event["model_transcription"],
+            user_correction=event["model_transcription"],
+            wer=0.0,
+            cer=0.0,
+            is_edited=False,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
 
 
-# ============================================================
-# MESSAGE
-# ============================================================
+def _dlq_consumer(stats: RunStats, stop_event: threading.Event) -> None:
+    """Consomme audio.uploaded.dlq pour comptabiliser les échecs définitifs."""
+    from services.kafka_service import kafka_service, TOPIC_AUDIO_UPLOADED_DLQ
 
-def build_message(audio_b64, user_id):
-    """
-    Construit EXACTEMENT le format attendu par
-    kafka_service.publish_audio_uploaded().
-    """
+    consumer = kafka_service.make_consumer(
+        TOPIC_AUDIO_UPLOADED_DLQ,
+        group_id=f"stresstest-dlq-{uuid.uuid4()}",
+        enable_auto_commit=True,
+    )
 
-    message_id = str(uuid.uuid4())
+    for record in consumer:
+        if stop_event.is_set():
+            break
 
-    return {
-        "message_id": message_id,
-        "chat_id": user_id,
-        "user_id": user_id,
-        "telegram_file_id": f"stress-{uuid.uuid4().hex[:12]}",
-        "audio_base64": audio_b64,
-        "duration_seconds": random.randint(3, 30),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        event = record.value
+        message_id = event.get("message_id")
+        with stats.lock:
+            stats.dlq_ids.add(message_id)
+
+        logger.warning(
+            "DLQ: message_id=%s reçu en échec définitif (%s)",
+            message_id, event.get("dlq_error")
+        )
+
+
+def _verify_elasticsearch(stats: RunStats, expected_ids: list, timeout_seconds: float) -> None:
+    """Interroge Elasticsearch jusqu'à ce que chaque message soit trouvé ou que le timeout expire."""
+    from services.elastic_service import elastic_service
+    from config.settings import settings
+
+    remaining = set(expected_ids) - stats.dlq_ids
+    deadline = time.monotonic() + timeout_seconds
+
+    while remaining and time.monotonic() < deadline:
+        found_this_round = set()
+
+        for message_id in list(remaining):
+            try:
+                elastic_service._client.get(index=settings.elastic_index, id=message_id)
+                found_this_round.add(message_id)
+            except Exception:
+                pass  # pas encore indexé
+
+        if found_this_round:
+            with stats.lock:
+                stats.indexed_ids |= found_this_round
+            remaining -= found_this_round
+
+        if remaining:
+            time.sleep(2.0)
+
+    if remaining:
+        logger.warning(
+            "%d message(s) toujours introuvables dans Elasticsearch après %.0fs: %s",
+            len(remaining), timeout_seconds,
+            list(remaining)[:20]
+        )
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    audio_bytes = _load_audio_bytes(args)
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+    logger.info("Échantillon audio: %d bytes (base64: %d chars)", len(audio_bytes), len(audio_b64))
+
+    stats = RunStats()
+    stop_event = threading.Event()
+
+    consumer_threads = [
+        threading.Thread(target=_transcribed_consumer, args=(stats, stop_event), daemon=True),
+        threading.Thread(target=_dlq_consumer, args=(stats, stop_event), daemon=True),
+    ]
+    for t in consumer_threads:
+        t.start()
+
+    logger.info(
+        "Démarrage de la charge: %d messages @ %.1f msg/s (durée théorique: %.1fs)",
+        args.count, args.rate, args.count / args.rate if args.rate > 0 else 0
+    )
+
+    t0 = time.monotonic()
+    _producer_worker(audio_b64, args.rate, args.count, stats)
+    send_duration = time.monotonic() - t0
+
+    logger.info(
+        "Charge envoyée en %.1fs. Attente de la fin du traitement en aval "
+        "(jusqu'à %.0fs)...",
+        send_duration, args.es_wait_timeout
+    )
+
+    _verify_elasticsearch(stats, list(stats.sent_at.keys()), args.es_wait_timeout)
+
+    stop_event.set()
+
+    # --- Rapport ---
+    sent_ids = set(stats.sent_at.keys())
+    indexed_ids = stats.indexed_ids
+    dlq_ids = stats.dlq_ids & sent_ids
+    accounted_ids = indexed_ids | dlq_ids
+    lost_ids = sent_ids - accounted_ids
+
+    latencies_ms = []
+    for mid in indexed_ids:
+        if mid in stats.transcribed_at:
+            latencies_ms.append((stats.transcribed_at[mid] - stats.sent_at[mid]) * 1000)
+
+    report = {
+        "sent": len(sent_ids),
+        "indexed_in_elasticsearch": len(indexed_ids),
+        "routed_to_dlq": len(dlq_ids),
+        "accounted_for": len(accounted_ids),
+        "lost_silently": len(lost_ids),
+        "lost_ids_sample": list(lost_ids)[:20],
+        "send_duration_seconds": round(send_duration, 1),
+        "actual_send_rate_msg_per_s": round(len(sent_ids) / send_duration, 1) if send_duration > 0 else None,
+        "latency_ms_p50": round(statistics.median(latencies_ms), 1) if latencies_ms else None,
+        "latency_ms_p95": (
+            round(statistics.quantiles(latencies_ms, n=20)[18], 1)
+            if len(latencies_ms) >= 20 else None
+        ),
+        "latency_ms_max": round(max(latencies_ms), 1) if latencies_ms else None,
     }
 
+    print("\n" + "=" * 60)
+    print("RAPPORT DE TEST DE CHARGE")
+    print("=" * 60)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    print("=" * 60)
 
-# ============================================================
-# DELIVERY REPORT
-# ============================================================
-
-class Statistics:
-
-    def __init__(self):
-        self.sent = 0
-        self.delivered = 0
-        self.failed = 0
-
-        self.partition_count = {
-            0: 0,
-            1: 0,
-            2: 0,
-        }
-
-        self.start_time = time.monotonic()
-
-    def delivery_report(self, err, msg):
-
-        if err is not None:
-            self.failed += 1
-
-            log.error(
-                "Kafka delivery FAILED : %s",
-                err,
-            )
-
-            return
-
-        self.delivered += 1
-
-        partition = msg.partition()
-
-        if partition not in self.partition_count:
-            self.partition_count[partition] = 0
-
-        self.partition_count[partition] += 1
-
-        log.info(
-            "Kafka -> topic=%s partition=%s offset=%s",
-            msg.topic(),
-            partition,
-            msg.offset(),
+    if lost_ids:
+        print(
+            f"\n❌ ÉCHEC : {len(lost_ids)} message(s) perdu(s) silencieusement "
+            f"(ni indexés, ni en DLQ)."
+        )
+    else:
+        print(
+            f"\n✅ SUCCÈS : 0 perte. {len(indexed_ids)} indexés, "
+            f"{len(dlq_ids)} routés en DLQ (attendu si fault-rate > 0)."
         )
 
-    def summary(self):
+    with open(args.report, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+    logger.info("Rapport écrit dans %s", args.report)
 
-        elapsed = time.monotonic() - self.start_time
-
-        effective_rate = (
-            self.sent / elapsed
-            if elapsed > 0
-            else 0
-        )
-
-        return (
-            "\n"
-            "=============================\n"
-            "       TEST SUMMARY\n"
-            "=============================\n"
-            f"Sent       : {self.sent}\n"
-            f"Delivered  : {self.delivered}\n"
-            f"Failed     : {self.failed}\n"
-            f"Elapsed    : {elapsed:.1f}s\n"
-            f"Rate       : {effective_rate:.2f} msg/s\n"
-            "\n"
-            "Kafka partitions:\n"
-            f"  partition 0 : {self.partition_count.get(0, 0)}\n"
-            f"  partition 1 : {self.partition_count.get(1, 0)}\n"
-            f"  partition 2 : {self.partition_count.get(2, 0)}\n"
-            "=============================\n"
-        )
+    sys.exit(1 if lost_ids else 0)
 
 
-# ============================================================
-# PUBLISH
-# ============================================================
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-def send_message(
-    producer,
-    stats,
-    csv_writer,
-    audio_b64,
-    user_pool,
-):
-    """
-    Publie un message sur audio.uploaded.
-    """
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
 
-    user_id = random.choice(user_pool)
+    p_mock = sub.add_parser("mock-whisper", help="Sert un faux Whisper avec injection de pannes")
+    p_mock.add_argument("--port", type=int, default=8090)
+    p_mock.add_argument("--fault-rate", type=float, default=0.3, help="Fraction (0-1) de requêtes en échec")
+    p_mock.add_argument("--fault-mode", choices=["timeout", "http500", "both"], default="both")
+    p_mock.add_argument("--slow-seconds", type=float, default=65.0, help="Durée du blocage simulé en mode timeout")
+    p_mock.set_defaults(func=cmd_mock_whisper)
 
-    payload = build_message(
-        audio_b64,
-        user_id,
-    )
-
-    message_id = payload["message_id"]
-
-    try:
-
-        producer.produce(
-            TOPIC,
-
-            # IMPORTANT :
-            # même logique que kafka_service.py
-            key=message_id.encode("utf-8"),
-
-            value=json.dumps(payload).encode("utf-8"),
-
-            callback=stats.delivery_report,
-        )
-
-        stats.sent += 1
-
-        csv_writer.writerow([
-            time.time(),
-            message_id,
-            user_id,
-        ])
-
-    except BufferError:
-
-        log.warning(
-            "Buffer Kafka plein. Attente..."
-        )
-
-        producer.poll(1)
-
-        return False
-
-    producer.poll(0)
-
-    return True
-
-
-# ============================================================
-# RATE CONSTANT
-# ============================================================
-
-def run_rate(
-    producer,
-    stats,
-    csv_writer,
-    audio_b64,
-    user_pool,
-    rate,
-    duration,
-):
-    """
-    Exécute un débit constant.
-    """
-
-    log.info(
-        "Test : %.2f msg/s pendant %.1f secondes",
-        rate,
-        duration,
-    )
-
-    interval = 1.0 / rate
-
-    end_time = time.monotonic() + duration
-
-    next_send = time.monotonic()
-
-    while (
-        time.monotonic() < end_time
-        and not _shutdown
-    ):
-
-        now = time.monotonic()
-
-        if now < next_send:
-            time.sleep(next_send - now)
-
-        send_message(
-            producer,
-            stats,
-            csv_writer,
-            audio_b64,
-            user_pool,
-        )
-
-        next_send += interval
-
-    producer.poll(0)
-
-
-# ============================================================
-# STEPS
-# ============================================================
-
-def parse_steps(value):
-
-    result = []
-
-    for item in value.split(","):
-
-        rate, duration = item.split(":")
-
-        result.append(
-            (
-                float(rate),
-                float(duration),
-            )
-        )
-
-    return result
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    parser = argparse.ArgumentParser(
-        description="Test de charge intelligent de toute la pipeline."
-    )
-
-    parser.add_argument(
-        "--bootstrap-servers",
-        default=DEFAULT_BOOTSTRAP,
-    )
-
-    parser.add_argument(
-        "--audio-file",
-        default=None,
-        help="Vrai fichier .ogg pour tester Whisper.",
-    )
-
-    parser.add_argument(
-        "--audio-size-bytes",
-        type=int,
-        default=10000,
-        help="Taille des bytes synthétiques.",
-    )
-
-    parser.add_argument(
-        "--rate",
-        type=float,
-        default=None,
-        help="Nombre de messages par seconde.",
-    )
-
-    parser.add_argument(
-        "--duration",
-        type=float,
-        default=30,
-        help="Durée du test en secondes.",
-    )
-
-    parser.add_argument(
-        "--steps",
-        default=None,
-        help="Exemple : 1:30,2:30,5:30,10:30",
-    )
-
-    parser.add_argument(
-        "--num-users",
-        type=int,
-        default=50,
-    )
-
-    parser.add_argument(
-        "--log-csv",
-        default="stress_test_sent.csv",
-    )
+    p_run = sub.add_parser("run", help="Génère la charge et vérifie l'absence de perte end-to-end")
+    p_run.add_argument("--count", type=int, default=200, help="Nombre de messages à envoyer")
+    p_run.add_argument("--rate", type=float, default=10.0, help="Débit cible en messages/seconde")
+    p_run.add_argument("--audio-file", type=str, default=None, help="Échantillon .ogg réel à utiliser")
+    p_run.add_argument("--es-wait-timeout", type=float, default=180.0, help="Secondes d'attente max pour la vérification ES")
+    p_run.add_argument("--report", type=str, default="stresstest_report.json")
+    p_run.set_defaults(func=cmd_run)
 
     args = parser.parse_args()
-
-    # --------------------------------------------------------
-    # Vérification arguments
-    # --------------------------------------------------------
-
-    if args.rate is None and args.steps is None:
-
-        parser.error(
-            "Fournissez --rate ou --steps"
-        )
-
-    if args.rate is not None and args.rate <= 0:
-
-        parser.error(
-            "--rate doit être > 0"
-        )
-
-    # --------------------------------------------------------
-    # Audio
-    # --------------------------------------------------------
-
-    audio_bytes = load_audio(
-        args.audio_file,
-        args.audio_size_bytes,
-    )
-
-    audio_b64 = base64.b64encode(
-        audio_bytes
-    ).decode("utf-8")
-
-    # --------------------------------------------------------
-    # Users
-    # --------------------------------------------------------
-
-    user_pool = list(
-        range(
-            1,
-            args.num_users + 1
-        )
-    )
-
-    # --------------------------------------------------------
-    # Kafka Producer
-    # --------------------------------------------------------
-
-    log.info(
-        "Kafka bootstrap servers: %s",
-        args.bootstrap_servers,
-    )
-
-    log.info(
-        "Topic: %s",
-        TOPIC,
-    )
-
-    producer = Producer({
-        "bootstrap.servers": args.bootstrap_servers,
-
-        # évite que le producer soit rapidement saturé
-        "queue.buffering.max.messages": 200000,
-
-        "linger.ms": 5,
-
-        # améliore la fiabilité
-        "acks": "all",
-    })
-
-    stats = Statistics()
-
-    # --------------------------------------------------------
-    # CSV
-    # --------------------------------------------------------
-
-    with open(
-        args.log_csv,
-        "w",
-        newline="",
-    ) as csv_file:
-
-        writer = csv.writer(csv_file)
-
-        writer.writerow([
-            "sent_at",
-            "message_id",
-            "user_id",
-        ])
-
-        # ----------------------------------------------------
-        # MODE RATE
-        # ----------------------------------------------------
-
-        if args.rate is not None:
-
-            run_rate(
-                producer,
-                stats,
-                writer,
-                audio_b64,
-                user_pool,
-                args.rate,
-                args.duration,
-            )
-
-        # ----------------------------------------------------
-        # MODE STEPS
-        # ----------------------------------------------------
-
-        else:
-
-            steps = parse_steps(
-                args.steps
-            )
-
-            for rate, duration in steps:
-
-                if _shutdown:
-                    break
-
-                log.info(
-                    "========== NOUVEAU PALIER =========="
-                )
-
-                log.info(
-                    "Rate = %.2f msg/s",
-                    rate,
-                )
-
-                log.info(
-                    "Durée = %.1f secondes",
-                    duration,
-                )
-
-                run_rate(
-                    producer,
-                    stats,
-                    writer,
-                    audio_b64,
-                    user_pool,
-                    rate,
-                    duration,
-                )
-
-    # --------------------------------------------------------
-    # FLUSH
-    # --------------------------------------------------------
-
-    log.info(
-        "Flush final Kafka..."
-    )
-
-    remaining = producer.flush(30)
-
-    if remaining > 0:
-
-        log.warning(
-            "%d messages encore dans la queue Kafka.",
-            remaining,
-        )
-
-    # --------------------------------------------------------
-    # SUMMARY
-    # --------------------------------------------------------
-
-    log.info(
-        stats.summary()
-    )
-
-    log.info(
-        "CSV créé : %s",
-        args.log_csv,
-    )
-
-    log.info(
-        "Le test Kafka est terminé."
-    )
-
-    log.info(
-        "Vérifiez maintenant :"
-    )
-
-    log.info(
-        "  audio.uploaded"
-    )
-
-    log.info(
-        "  MinIO audio-archive"
-    )
-
-    log.info(
-        "  audio.stored"
-    )
-
-    log.info(
-        "  audio.transcribed"
-    )
-
-    log.info(
-        "  transcription.corrected"
-    )
-
-    log.info(
-        "  Elasticsearch / Kibana"
-    )
+    args.func(args)
 
 
 if __name__ == "__main__":
     main()
-
