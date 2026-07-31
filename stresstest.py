@@ -187,20 +187,93 @@ def _verify_elasticsearch_wildcard(stats: SmartRunStats, expected_ids: set, time
 
 
 def cmd_smart_run(args: argparse.Namespace):
-    # Attente du dépilage complet par ASR en mode burst
-    if getattr(args, "burst", False):
-        logger.info(f"⏳ Attente du traitement du backlog par Whisper ASR (Timeout: {args.asr_timeout}s)...")
-        drain_deadline = time.monotonic() + args.asr_timeout
-        while len(stats.transcribed_events) < len(sent_ids) and time.monotonic() < drain_deadline:
-            time.sleep(1.0)
-            if len(stats.transcribed_events) % 50 == 0 and len(stats.transcribed_events) > 0:
-                logger.info(f"Progression ASR : {len(stats.transcribed_events)} / {len(sent_ids)} transcrits...")
+    if not args.audio_file:
+        logger.error("Veuillez fournir --audio-file sample.ogg")
+        sys.exit(1)
+
+    with open(args.audio_file, "rb") as f:
+        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    stats = SmartRunStats()
+    stop_event = threading.Event()
+
+    t_transcribed = threading.Thread(target=_transcribed_listener, args=(stats, stop_event), daemon=True)
+    t_dlq = threading.Thread(target=_dlq_listener, args=(stats, stop_event), daemon=True)
+    t_transcribed.start()
+    t_dlq.start()
 
     logger.info("🔥 === DÉMARRAGE DU TEST DE CHARGE ===")
     logger.info(f"Threads Simultanés : {args.users} | Total Messages : {args.total}")
 
     t0 = time.monotonic()
 
+    # 1. ÉTAPE D'INJECTION (Envoi des messages dans Kafka)
+    with ThreadPoolExecutor(max_workers=args.users) as executor:
+        futures = []
+        for i in range(args.total):
+            user_idx = i % args.users
+            session_id = i // args.users
+            futures.append(executor.submit(simulate_user_session, user_idx, session_id, audio_b64, stats, args))
+
+        for f in futures:
+            f.result()
+
+    injection_duration = time.monotonic() - t0
+    sent_ids = set(stats.sent_at.keys())
+
+    logger.info(f"⚡ Injection Kafka terminée en {round(injection_duration, 2)}s ({round(len(sent_ids)/injection_duration, 2)} msg/s)")
+
+    # 2. ÉTAPE D'ATTENTE DU DÉPILAGE ASR (Spécifique au mode Burst)
+    if getattr(args, "burst", False):
+        logger.info(f"⏳ Mode Burst actif: Attente du dépilage du backlog par Whisper (Timeout: {args.asr_timeout}s)...")
+        drain_deadline = time.monotonic() + args.asr_timeout
+        last_logged_count = -1
+
+        while len(stats.transcribed_events) < len(sent_ids) and time.monotonic() < drain_deadline:
+            current_count = len(stats.transcribed_events)
+            if current_count % 50 == 0 and current_count != last_logged_count and current_count > 0:
+                logger.info(f"   Progression Whisper ASR : {current_count} / {len(sent_ids)} transcrits...")
+                last_logged_count = current_count
+            time.sleep(0.5)
+
+    total_execution_time = time.monotonic() - t0
+
+    # 3. ÉTAPE DE VÉRIFICATION ELASTICSEARCH (Optionnelle)
+    if not args.skip_es_check:
+        _verify_elasticsearch_wildcard(stats, sent_ids, args.es_wait_timeout)
+
+    stop_event.set()
+
+    # 4. GÉNÉRATION DU RAPPORT DE PERFORMANCE
+    indexed_len = len(stats.indexed_ids) if not args.skip_es_check else "CHECK_SKIPPED"
+    dlq_len = len(stats.dlq_ids & sent_ids)
+    failed_len = len(stats.failed_sessions)
+
+    latencies = [
+        (stats.transcribed_at[mid] - stats.sent_at[mid]) * 1000
+        for mid in stats.transcribed_at if mid in stats.sent_at
+    ]
+
+    report = {
+        "sent": len(sent_ids),
+        "transcribed_by_asr": len(stats.transcribed_events),
+        "indexed_in_elasticsearch": indexed_len,
+        "routed_to_dlq": dlq_len,
+        "failed_sessions": failed_len,
+        "injection_duration_seconds": round(injection_duration, 2),
+        "total_pipeline_duration_seconds": round(total_execution_time, 2),
+        "injection_throughput_msg_per_s": round(len(sent_ids) / injection_duration, 2) if injection_duration > 0 else 0,
+        "asr_processing_throughput_msg_per_s": round(len(stats.transcribed_events) / total_execution_time, 2) if total_execution_time > 0 else 0,
+        "latency_ms_p50": round(statistics.median(latencies), 1) if latencies else None,
+        "latency_ms_p95": round(statistics.quantiles(latencies, n=20)[18], 1) if len(latencies) >= 20 else None,
+    }
+
+    print("\n" + "=" * 60)
+    print("RAPPORT DE STRESS TEST PIPELINE")
+    print("=" * 60)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    print("=" * 60 + "\n")
+    
     with ThreadPoolExecutor(max_workers=args.users) as executor:
         futures = []
         for i in range(args.total):
