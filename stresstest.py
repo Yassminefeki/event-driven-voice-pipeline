@@ -57,8 +57,11 @@ class SmartRunStats:
 def _transcribed_listener(stats: SmartRunStats, stop_event: threading.Event):
     from services.kafka_service import kafka_service
 
+    # Remplacez "audio.transcribed" par le bon topic détecté à l'étape 1 (ex: "audio.trancribed")
+    TARGET_TOPIC = "audio.trancribed"  
+
     consumer = kafka_service.make_consumer(
-        "audio.transcribed",
+        TARGET_TOPIC,
         group_id=f"stresstest-listener-{uuid.uuid4()}",
         enable_auto_commit=True,
         auto_offset_reset="latest",
@@ -68,26 +71,15 @@ def _transcribed_listener(stats: SmartRunStats, stop_event: threading.Event):
         records = consumer.poll(timeout_ms=500)
         for tp, msgs in records.items():
             for record in msgs:
-                val = record.value
-                if not val:
-                    continue
-                
-                # Extraction ultra-flexible de l'UUID
-                mid = None
-                if isinstance(val, dict):
-                    mid = val.get("message_id") or val.get("id") or val.get("payload", {}).get("message_id")
-                elif isinstance(val, str):
-                    try:
-                        parsed = json.loads(val)
-                        mid = parsed.get("message_id") or parsed.get("id")
-                    except Exception:
-                        pass
+                if record.value:
+                    val = record.value
+                    mid = val.get("message_id") if isinstance(val, dict) else None
+                    if mid:
+                        with stats.lock:
+                            if str(mid) in stats.sent_at:
+                                stats.register_transcription(val)
+                                
 
-                if mid:
-                    mid = str(mid)
-                    with stats.lock:
-                        if mid in stats.sent_at:
-                            stats.register_transcription(val)
 def _dlq_listener(stats: SmartRunStats, stop_event: threading.Event):
     from services.kafka_service import kafka_service, TOPIC_AUDIO_UPLOADED_DLQ
 
@@ -286,7 +278,7 @@ def cmd_smart_run(args: argparse.Namespace):
     print("=" * 60)
     print(json.dumps(report, indent=2, ensure_ascii=False))
     print("=" * 60 + "\n")
-    
+
     with ThreadPoolExecutor(max_workers=args.users) as executor:
         futures = []
         for i in range(args.total):
