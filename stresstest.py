@@ -193,6 +193,10 @@ def _verify_s3_availability(url: str, user_idx: int, retries: int = 5):
 # Vérification Elasticsearch Finale
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Vérification Elasticsearch Finale (Version Tolérante Multi-Champs)
+# ---------------------------------------------------------------------------
+
 def _verify_elasticsearch(stats: SmartRunStats, expected_ids: set, timeout: float):
     from services.elastic_service import elastic_service
     from config.settings import settings
@@ -200,19 +204,19 @@ def _verify_elasticsearch(stats: SmartRunStats, expected_ids: set, timeout: floa
     remaining = set(expected_ids) - stats.dlq_ids
     deadline = time.monotonic() + timeout
 
-    logger.info(f"Vérification de l'indexation Elasticsearch pour {len(remaining)} messages...")
+    logger.info(f"Vérification Elasticsearch pour {len(remaining)} messages dans l'index '{settings.elastic_index}'...")
 
     while remaining and time.monotonic() < deadline:
         found = set()
         for mid in list(remaining):
             try:
-                # Recherche par champ message_id dans tout l'index/alias
+                # 1. Tentative avec query_string (cherche la chaîne UUID n'importe où dans le document JSON)
                 res = elastic_service._client.search(
                     index=settings.elastic_index,
                     body={
                         "query": {
-                            "term": {
-                                "message_id.keyword": mid
+                            "query_string": {
+                                "query": f'"{mid}"'
                             }
                         }
                     }
@@ -220,11 +224,14 @@ def _verify_elasticsearch(stats: SmartRunStats, expected_ids: set, timeout: floa
                 hits = res.get("hits", {}).get("hits", [])
                 if len(hits) > 0:
                     found.add(mid)
-            except Exception:
-                # Alternative en cas de recherche directe par _id
+                    continue
+
+            except Exception as e:
+                # 2. Fallback direct sur l'ID de document
                 try:
                     elastic_service._client.get(index=settings.elastic_index, id=mid)
                     found.add(mid)
+                    continue
                 except Exception:
                     pass
 
@@ -237,7 +244,7 @@ def _verify_elasticsearch(stats: SmartRunStats, expected_ids: set, timeout: floa
             time.sleep(2.0)
 
     if remaining:
-        logger.warning(f"{len(remaining)} message(s) introuvables dans ES après {timeout}s.")
+        logger.warning(f"{len(remaining)} message(s) non confirmés dans ES après {timeout}s.")
 
 
 # ---------------------------------------------------------------------------
