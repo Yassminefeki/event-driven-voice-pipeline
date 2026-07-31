@@ -206,10 +206,27 @@ def _verify_elasticsearch(stats: SmartRunStats, expected_ids: set, timeout: floa
         found = set()
         for mid in list(remaining):
             try:
-                elastic_service._client.get(index=settings.elastic_index, id=mid)
-                found.add(mid)
+                # Recherche par champ message_id dans tout l'index/alias
+                res = elastic_service._client.search(
+                    index=settings.elastic_index,
+                    body={
+                        "query": {
+                            "term": {
+                                "message_id.keyword": mid
+                            }
+                        }
+                    }
+                )
+                hits = res.get("hits", {}).get("hits", [])
+                if len(hits) > 0:
+                    found.add(mid)
             except Exception:
-                pass
+                # Alternative en cas de recherche directe par _id
+                try:
+                    elastic_service._client.get(index=settings.elastic_index, id=mid)
+                    found.add(mid)
+                except Exception:
+                    pass
 
         if found:
             with stats.lock:
