@@ -33,6 +33,26 @@ Kafka Connect ES Sink) : il suppose qu'ils tournent déjà. Il a trois modes :
      interroge Elasticsearch pour vérifier que 100% des messages envoyés
      sont retrouvés (indexés OU en DLQ), avec mesure de latence e2e.
 
+IMPORTANT — CORRECTIF "réplication d'historique Kafka" (2026-08) :
+    Les runs précédents du script généraient un group_id Kafka ALÉATOIRE
+    (uuid4) à chaque exécution pour les consumers `audio.transcribed` et
+    `audio.uploaded.dlq`. Résultat : chaque nouveau run repartait sans
+    offset connu et rejouait TOUT l'historique du topic depuis le début
+    (selon auto_offset_reset), en plus des nouveaux messages -> le compte
+    de documents indexés dans Elasticsearch explosait au fil des runs
+    (200 attendus, mais 1170 puis 1370 observés), même après avoir vidé
+    l'index Elasticsearch (le topic Kafka, lui, n'était pas vidé).
+
+    Deux corrections sont appliquées ci-dessous, en profondeur :
+      a) group_id STABLE (plus de uuid4) + auto_offset_reset="latest" ->
+         un nouveau group ne relit plus l'historique, seulement ce qui
+         est publié après le démarrage du consumer.
+      b) Filtrage applicatif : le consumer ignore tout message dont le
+         message_id n'appartient pas au run en cours (stats.sent_at).
+         Cette 2e barrière protège même si un groupe existant a un
+         vieil offset, si un rebalance survient, ou si plusieurs
+         instances du test tournent en parallèle.
+
 Usage :
     # Étape 0 (recommandé) : mesurer la vraie capacité de concurrence de
     # Whisper, sans Kafka, pour calibrer ASR_WORKER_CONCURRENCY
@@ -68,6 +88,13 @@ logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
 logger = logging.getLogger("stresstest")
+
+# Group ids STABLES (et non plus des uuid4 générés à chaque run). Avec
+# auto_offset_reset="latest", un run qui redémarre ne relit que ce qui a
+# été publié après le (re)démarrage du consumer, jamais l'historique
+# accumulé par les runs précédents.
+TRANSCRIBED_GROUP_ID = "stresstest-transcribed-consumer"
+DLQ_GROUP_ID = "stresstest-dlq-consumer"
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +339,16 @@ class RunStats:
     indexed_ids: set = field(default_factory=set)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
+    def belongs_to_this_run(self, message_id: str) -> bool:
+        """
+        Filtrage applicatif : n'accepte que les messages appartenant au run
+        en cours. Empêche un consumer qui rejouerait un vieil historique
+        Kafka (offset existant, rebalance, run parallèle, etc.) de polluer
+        les stats et de republier vers transcription.corrected / ES.
+        """
+        with self.lock:
+            return message_id in self.sent_at
+
 
 def _producer_worker(audio_b64: str, rate: float, count: int, stats: RunStats) -> None:
     """Publie `count` messages audio.uploaded à un débit cible de `rate` msg/s."""
@@ -358,63 +395,106 @@ def _transcribed_consumer(stats: RunStats, stop_event: threading.Event) -> None:
     Consomme audio.transcribed et simule immédiatement l'action "Valider"
     de l'utilisateur (comme le ferait le bot Telegram), afin que le message
     poursuive sa route jusqu'à transcription.corrected -> Elasticsearch.
+
+    CORRECTIF : group_id stable + auto_offset_reset="latest" pour ne
+    jamais relire l'historique accumulé par les runs précédents, PLUS un
+    filtre applicatif (stats.belongs_to_this_run) qui ignore tout message
+    dont le message_id n'a pas été envoyé par CE run. Double barrière.
     """
     from services.kafka_service import kafka_service
 
     consumer = kafka_service.make_consumer(
         "audio.transcribed",
-        group_id=f"stresstest-transcribed-{uuid.uuid4()}",
+        group_id=TRANSCRIBED_GROUP_ID,
         enable_auto_commit=True,
+        auto_offset_reset="latest",
     )
 
-    for record in consumer:
-        if stop_event.is_set():
-            break
+    while not stop_event.is_set():
+        records = consumer.poll(timeout_ms=500)
+        if not records:
+            continue
 
-        event = record.value
-        message_id = event["message_id"]
+        for _tp, batch in records.items():
+            for record in batch:
+                event = record.value
+                message_id = event.get("message_id")
 
-        with stats.lock:
-            stats.transcribed_at[message_id] = time.monotonic()
+                if not message_id or not stats.belongs_to_this_run(message_id):
+                    logger.debug(
+                        "audio.transcribed: message_id=%s ignoré "
+                        "(hors périmètre du run en cours)", message_id
+                    )
+                    continue
 
-        # Auto-validation (équivalent du clic "✅ Valider" côté bot)
-        kafka_service.publish_transcription_corrected(
-            message_id=message_id,
-            chat_id=event["chat_id"],
-            user_id=event["user_id"],
-            audio_url=event.get("audio_url", ""),
-            model_transcription=event["model_transcription"],
-            user_correction=event["model_transcription"],
-            wer=0.0,
-            cer=0.0,
-            is_edited=False,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-        )
+                with stats.lock:
+                    stats.transcribed_at[message_id] = time.monotonic()
+
+                # Auto-validation (équivalent du clic "✅ Valider" côté bot)
+                kafka_service.publish_transcription_corrected(
+                    message_id=message_id,
+                    chat_id=event["chat_id"],
+                    user_id=event["user_id"],
+                    audio_url=event.get("audio_url", ""),
+                    model_transcription=event["model_transcription"],
+                    user_correction=event["model_transcription"],
+                    wer=0.0,
+                    cer=0.0,
+                    is_edited=False,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                )
+
+    try:
+        consumer.close()
+    except Exception:
+        pass
 
 
 def _dlq_consumer(stats: RunStats, stop_event: threading.Event) -> None:
-    """Consomme audio.uploaded.dlq pour comptabiliser les échecs définitifs."""
+    """
+    Consomme audio.uploaded.dlq pour comptabiliser les échecs définitifs.
+
+    Mêmes correctifs que _transcribed_consumer : group_id stable +
+    auto_offset_reset="latest" + filtre applicatif par message_id.
+    """
     from services.kafka_service import kafka_service, TOPIC_AUDIO_UPLOADED_DLQ
 
     consumer = kafka_service.make_consumer(
         TOPIC_AUDIO_UPLOADED_DLQ,
-        group_id=f"stresstest-dlq-{uuid.uuid4()}",
+        group_id=DLQ_GROUP_ID,
         enable_auto_commit=True,
+        auto_offset_reset="latest",
     )
 
-    for record in consumer:
-        if stop_event.is_set():
-            break
+    while not stop_event.is_set():
+        records = consumer.poll(timeout_ms=500)
+        if not records:
+            continue
 
-        event = record.value
-        message_id = event.get("message_id")
-        with stats.lock:
-            stats.dlq_ids.add(message_id)
+        for _tp, batch in records.items():
+            for record in batch:
+                event = record.value
+                message_id = event.get("message_id")
 
-        logger.warning(
-            "DLQ: message_id=%s reçu en échec définitif (%s)",
-            message_id, event.get("dlq_error")
-        )
+                if not message_id or not stats.belongs_to_this_run(message_id):
+                    logger.debug(
+                        "audio.uploaded.dlq: message_id=%s ignoré "
+                        "(hors périmètre du run en cours)", message_id
+                    )
+                    continue
+
+                with stats.lock:
+                    stats.dlq_ids.add(message_id)
+
+                logger.warning(
+                    "DLQ: message_id=%s reçu en échec définitif (%s)",
+                    message_id, event.get("dlq_error")
+                )
+
+    try:
+        consumer.close()
+    except Exception:
+        pass
 
 
 def _verify_elasticsearch(stats: RunStats, expected_ids: list, timeout_seconds: float) -> None:
@@ -466,6 +546,11 @@ def cmd_run(args: argparse.Namespace) -> None:
     for t in consumer_threads:
         t.start()
 
+    # Laisse le temps aux consumers de rejoindre leur groupe / d'obtenir
+    # leur assignation de partitions AVANT de commencer à publier, pour
+    # que "latest" ne rate pas les tout premiers messages du run.
+    time.sleep(2.0)
+
     logger.info(
         "Démarrage de la charge: %d messages @ %.1f msg/s (durée théorique: %.1fs)",
         args.count, args.rate, args.count / args.rate if args.rate > 0 else 0
@@ -484,6 +569,8 @@ def cmd_run(args: argparse.Namespace) -> None:
     _verify_elasticsearch(stats, list(stats.sent_at.keys()), args.es_wait_timeout)
 
     stop_event.set()
+    for t in consumer_threads:
+        t.join(timeout=5.0)
 
     # --- Rapport ---
     sent_ids = set(stats.sent_at.keys())
