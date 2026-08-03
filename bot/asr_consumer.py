@@ -1,4 +1,3 @@
-
 """
 Step 10: bot consumes audio.transcribed and sends the transcription
 back to the user for validation.
@@ -91,10 +90,16 @@ async def run_asr_consumer_loop(
                         reply_markup=keyboard,
                     )
 
-                    
                 except TelegramError:
                     # Une erreur Telegram sur CE message ne doit jamais
                     # interrompre la consommation des messages suivants.
+                    #
+                    # NB: les erreurs de type "Chat not found" (BadRequest)
+                    # sont DEFINITIVES : le chat_id n'existe pas / n'a jamais
+                    # démarré de conversation avec le bot, et un retry ne
+                    # changera jamais ce résultat. On committe donc l'offset
+                    # pour ne pas rejouer ce message à l'infini à chaque
+                    # redémarrage du consumer.
                     logger.exception(
                         "message_id=%s: échec d'envoi Telegram à chat_id=%s, "
                         "message ignoré, la boucle continue",
@@ -102,7 +107,12 @@ async def run_asr_consumer_loop(
                         chat_id,
                     )
                     pending_transcriptions.pop(message_id, None)
+                    kafka_service.commit_offset(consumer, record)
                     continue
+
+                # Envoi réussi : on committe l'offset pour ne jamais
+                # re-livrer ce message au prochain poll / redémarrage.
+                kafka_service.commit_offset(consumer, record)
 
                 message_id_map[sent.message_id] = message_id
 
@@ -111,4 +121,3 @@ async def run_asr_consumer_loop(
                     message_id,
                     chat_id,
                 )
-
