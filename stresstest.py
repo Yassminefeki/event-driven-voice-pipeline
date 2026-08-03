@@ -69,6 +69,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("stresstest")
 
+STRESSTEST_START_FROM_LATEST = True
+
 
 # ---------------------------------------------------------------------------
 # Mode 1 : faux serveur Whisper avec injection de pannes
@@ -363,9 +365,10 @@ def _transcribed_consumer(stats: RunStats, stop_event: threading.Event) -> None:
 
     consumer = kafka_service.make_consumer(
         "audio.transcribed",
-        group_id=f"stresstest-transcribed-{uuid.uuid4()}",
+        group_id="stresstest-transcribed",
         enable_auto_commit=True,
-    )
+        auto_offset_reset="latest" if STRESSTEST_START_FROM_LATEST else "earliest",
+        )
 
     for record in consumer:
         if stop_event.is_set():
