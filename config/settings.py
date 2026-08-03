@@ -39,6 +39,13 @@ class Settings:
     # --- Elasticsearch ---
     elastic_url: str = os.getenv("ELASTIC_URL", "")
     elastic_index: str = os.getenv("ELASTIC_INDEX", "transcription.corrected")  # step 14
+    # Concurrence du worker ASR : nombre d'appels Whisper en vol simultanément.
+    # À régler selon la capacité réelle mesurée avec `stresstest.py whisper-load`.
+    asr_worker_concurrency: int = int(os.getenv("ASR_WORKER_CONCURRENCY", "10"))
+
+    # Taille du lot polled par tour de boucle. Doit être >= asr_worker_concurrency
+    # pour que le pool de threads soit réellement saturé.
+    asr_worker_batch_size: int = int(os.getenv("ASR_WORKER_BATCH_SIZE", "20"))
 
 
 settings = Settings()

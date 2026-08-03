@@ -242,6 +242,35 @@ class KafkaService:
         """
         tp = TopicPartition(record.topic, record.partition)
         consumer.commit({tp: OffsetAndMetadata(record.offset + 1, None)})
+    
+    @staticmethod
+    def commit_offsets(consumer: KafkaConsumer, offsets: dict) -> None:
+        """
+        Committe plusieurs partitions en une seule fois, en fin de lot concurrent.
+
+        offsets : dict[TopicPartition, int] -> offset "suivant" à committer
+        (c'est-à-dire offset du dernier message sûr traité + 1), déjà calculé par
+        l'appelant selon la règle : ne jamais committer au-delà d'un message en
+        échec transitoire dans le lot (voir whisper_worker.py::run()).
+
+        Une partition absente du dict n'est simplement pas committée ce tour-ci
+        (ex: le tout premier message de cette partition dans le lot a déjà
+        échoué transitoirement -> rien de "sûr" à committer).
+        """
+        if not offsets:
+            return
+
+        to_commit = {
+            tp: OffsetAndMetadata(next_offset, None)
+            for tp, next_offset in offsets.items()
+        }
+        consumer.commit(to_commit)
+
+        for tp, next_offset in offsets.items():
+            logger.info(
+                "Batch commit: topic=%s partition=%s -> offset=%d",
+                tp.topic, tp.partition, next_offset
+            )
 
 
 kafka_service = KafkaService()

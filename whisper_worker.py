@@ -163,6 +163,84 @@ def process_message(event: dict) -> None:
     logger.info("message_id=%s: transcription published successfully", message_id)
 
 
+import binascii
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from kafka.structs import TopicPartition
+
+
+def _process_one_safe(record) -> tuple:
+    """
+    Wrapper qui exécute process_message() sans jamais laisser une exception
+    remonter dans le thread pool : on classe le résultat pour que le thread
+    appelant décide du commit, plutôt que de committer depuis le thread
+    worker lui-même (le commit reste centralisé et séquentiel, cf. run()).
+
+    Retourne (record, outcome, detail) avec outcome in:
+      "success"    -> traité et publié avec succès
+      "dlq"        -> échec définitif classé, déjà routé en DLQ
+      "transient"  -> échec probablement transitoire, NE PAS committer
+    """
+    message_id = record.value.get("message_id", "unknown")
+
+    try:
+        process_message(record.value)
+        return (record, "success", None)
+
+    except WhisperTranscriptionError as exc:
+        logger.error(
+            "message_id=%s: transcription définitivement échouée -> DLQ",
+            message_id
+        )
+        kafka_service.publish_audio_uploaded_dlq(record.value, str(exc))
+        return (record, "dlq", str(exc))
+
+    except (KeyError, binascii.Error, ValueError) as exc:
+        logger.error(
+            "message_id=%s: message malformé (%s) -> DLQ",
+            message_id, exc
+        )
+        kafka_service.publish_audio_uploaded_dlq(record.value, f"malformed: {exc}")
+        return (record, "dlq", str(exc))
+
+    except Exception as exc:
+        logger.exception(
+            "message_id=%s: échec transitoire (%s), NON committé -> sera re-livré",
+            message_id, exc
+        )
+        return (record, "transient", str(exc))
+
+
+def _compute_safe_commit_offsets(results: list) -> dict:
+    """
+    Calcule, par partition, l'offset jusqu'où il est sûr de committer.
+
+    Règle : on parcourt les messages de CHAQUE partition triés par offset
+    croissant. On avance tant que le résultat est "success" ou "dlq". Dès
+    qu'on tombe sur "transient", on s'arrête pour cette partition : rien
+    au-delà n'est committé (le message transitoire ET tout ce qui suit
+    seront re-livrés au prochain poll, ce qui est correct et sans perte).
+    """
+    by_partition: dict = {}
+    for record, outcome, _detail in results:
+        tp = TopicPartition(record.topic, record.partition)
+        by_partition.setdefault(tp, []).append((record.offset, outcome))
+
+    safe_offsets = {}
+    for tp, entries in by_partition.items():
+        entries.sort(key=lambda e: e[0])
+
+        last_safe_offset = None
+        for offset, outcome in entries:
+            if outcome == "transient":
+                break
+            last_safe_offset = offset
+
+        if last_safe_offset is not None:
+            safe_offsets[tp] = last_safe_offset + 1
+
+    return safe_offsets
+
+
 def run() -> None:
 
     listener_thread = threading.Thread(
@@ -171,58 +249,54 @@ def run() -> None:
     )
     listener_thread.start()
 
-    # enable_auto_commit=False : commit explicite ci-dessous, uniquement
-    # après succès ou envoi en DLQ. C'est LE correctif contre la perte de
-    # messages sous forte charge.
     consumer = kafka_service.make_consumer(
         settings.topic_audio_uploaded,
         group_id=settings.kafka_group_id_worker,
         enable_auto_commit=False,
     )
 
+    concurrency = settings.asr_worker_concurrency
+    batch_size = settings.asr_worker_batch_size
+
     logger.info(
-        "ASR Worker listening on topic=%s group=%s",
+        "ASR Worker (concurrent, batch) listening on topic=%s group=%s "
+        "concurrency=%d batch_size=%d",
         settings.topic_audio_uploaded,
-        settings.kafka_group_id_worker
+        settings.kafka_group_id_worker,
+        concurrency, batch_size,
     )
 
-    for record in consumer:
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        while True:
+            # max_records borne la taille du lot pour garder un contrôle
+            # explicite sur la concurrence réellement envoyée à Whisper.
+            polled = consumer.poll(timeout_ms=1000, max_records=batch_size)
 
-        event = record.value
-        message_id = event.get("message_id", "unknown")
+            if not polled:
+                continue
 
-        try:
-            process_message(event)
-            kafka_service.commit_offset(consumer, record)
+            records = [r for records_list in polled.values() for r in records_list]
 
-        except WhisperTranscriptionError as exc:
-            # Échec définitif classé (retries Whisper épuisés) : on ne perd
-            # pas le message, on le route en DLQ, puis on avance.
-            logger.error(
-                "message_id=%s: transcription Whisper définitivement échouée -> DLQ",
-                message_id
-            )
-            kafka_service.publish_audio_uploaded_dlq(event, str(exc))
-            kafka_service.commit_offset(consumer, record)
+            if not records:
+                continue
 
-        except (KeyError, binascii.Error, ValueError) as exc:
-            # Message malformé (poison pill) : le retenter ne changera rien,
-            # on le route en DLQ pour ne pas bloquer indéfiniment la partition.
-            logger.error(
-                "message_id=%s: message malformé (%s) -> DLQ",
-                message_id, exc
-            )
-            kafka_service.publish_audio_uploaded_dlq(event, f"malformed: {exc}")
-            kafka_service.commit_offset(consumer, record)
+            logger.info("Batch de %d message(s) soumis en concurrence (max %d en vol)",
+                        len(records), concurrency)
 
-        except Exception:
-            # Erreur imprévue / transitoire (ex. Kafka indisponible lors de
-            # la publication en aval) : on NE COMMIT PAS. Le message sera
-            # re-livré (at-least-once) au prochain poll ou après restart.
-            logger.exception(
-                "message_id=%s: processing FAILED (erreur transitoire, "
-                "message NON committé -> sera re-livré)",
-                message_id
+            futures = [pool.submit(_process_one_safe, r) for r in records]
+            results = [f.result() for f in as_completed(futures)]
+
+            safe_offsets = _compute_safe_commit_offsets(results)
+            kafka_service.commit_offsets(consumer, safe_offsets)
+
+            n_success = sum(1 for _, o, _ in results if o == "success")
+            n_dlq = sum(1 for _, o, _ in results if o == "dlq")
+            n_transient = sum(1 for _, o, _ in results if o == "transient")
+
+            logger.info(
+                "Batch terminé: %d succès, %d DLQ, %d transitoire(s) "
+                "(non committé -> re-livré)",
+                n_success, n_dlq, n_transient
             )
 
 
