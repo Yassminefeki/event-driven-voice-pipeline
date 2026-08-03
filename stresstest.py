@@ -310,6 +310,7 @@ class RunStats:
     transcribed_at: dict = field(default_factory=dict)    # message_id -> receive timestamp
     dlq_ids: set = field(default_factory=set)
     indexed_ids: set = field(default_factory=set)
+    run_ids: set = field(default_factory=set)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
 
@@ -321,8 +322,10 @@ def _producer_worker(audio_b64: str, rate: float, count: int, stats: RunStats) -
 
     def send_one(i: int):
         message_id = str(uuid.uuid4())
+
         with stats.lock:
             stats.sent_at[message_id] = time.monotonic()
+            stats.run_ids.add(message_id)
 
         kafka_service.publish_audio_uploaded(
             message_id=message_id,
@@ -363,7 +366,7 @@ def _transcribed_consumer(stats: RunStats, stop_event: threading.Event) -> None:
 
     consumer = kafka_service.make_consumer(
         "audio.transcribed",
-        group_id=f"stresstest-transcribed-{uuid.uuid4()}",
+        group_id="stresstest-transcribed-consumer",
         enable_auto_commit=True,
     )
 
@@ -373,6 +376,11 @@ def _transcribed_consumer(stats: RunStats, stop_event: threading.Event) -> None:
 
         event = record.value
         message_id = event["message_id"]
+        with stats.lock:
+            if message_id not in stats.run_ids:
+                continue
+
+            stats.transcribed_at[message_id] = time.monotonic()
 
         with stats.lock:
             stats.transcribed_at[message_id] = time.monotonic()
@@ -398,7 +406,7 @@ def _dlq_consumer(stats: RunStats, stop_event: threading.Event) -> None:
 
     consumer = kafka_service.make_consumer(
         TOPIC_AUDIO_UPLOADED_DLQ,
-        group_id=f"stresstest-dlq-{uuid.uuid4()}",
+        group_id="stresstest-dlq-consumer",
         enable_auto_commit=True,
     )
 
