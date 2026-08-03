@@ -101,6 +101,7 @@ async def run_asr_consumer_loop(
                         message_id,
                         chat_id,
                     )
+                    pending_transcriptions.pop(message_id, None)
                     continue
 
                 message_id_map[sent.message_id] = message_id
