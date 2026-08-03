@@ -1,22 +1,17 @@
 """
-Script ONE-SHOT à lancer UNE SEULE FOIS (bot arrêté) pour purger le
-backlog du topic audio.transcribed pour le consumer group du bot.
+Script ONE-SHOT à lancer UNE SEULE FOIS (whisper_worker.py arrêté) pour
+purger le backlog du topic audio.uploaded pour le consumer group du
+worker Whisper (asr-worker-group).
 
-Ce script ne supprime PAS les messages du topic Kafka lui-même (ça
-nécessiterait des droits admin sur le cluster) : il avance simplement
-les offsets committés du group_id du bot jusqu'à la toute fin du
-topic, comme si tout le backlog actuel avait déjà été lu.
-
-=> Tous les vieux messages (fantômes du stress test ET vrais messages
-   en attente) seront ignorés. Seuls les NOUVEAUX messages publiés
-   après l'exécution de ce script seront traités par le bot.
+Même logique que purge_backlog.py, mais appliqué au topic/groupe
+responsable de la transcription (source du flot de faux messages
+audio.transcribed observé côté bot).
 
 USAGE :
-    1. Arrête le bot (python3 main.py) -- IMPORTANT, ne pas lancer
-       ce script pendant que le bot tourne, sinon conflit de consumer
-       group.
-    2. python3 purge_backlog.py
-    3. Relance le bot normalement : python3 main.py
+    1. Arrête whisper_worker.py s'il tourne quelque part (ou vérifie
+       qu'aucun membre actif n'existe déjà via --describe).
+    2. python3 purge_backlog_uploaded.py
+    3. Relance whisper_worker.py normalement.
 """
 
 import logging
@@ -46,7 +41,6 @@ def purge_backlog(topic: str, group_id: str) -> None:
     tps = [TopicPartition(topic, p) for p in partitions]
     consumer.assign(tps)
 
-    # Va directement à la fin de chaque partition (dernier offset dispo)
     consumer.seek_to_end(*tps)
 
     end_offsets = {tp: consumer.position(tp) for tp in tps}
@@ -57,7 +51,6 @@ def purge_backlog(topic: str, group_id: str) -> None:
             tp.partition, offset
         )
 
-    # Committe ces offsets "fin de topic" pour le group_id du bot
     consumer.commit({
         tp: OffsetAndMetadata(offset, None)
         for tp, offset in end_offsets.items()
@@ -73,6 +66,6 @@ def purge_backlog(topic: str, group_id: str) -> None:
 
 if __name__ == "__main__":
     purge_backlog(
-        topic=settings.topic_audio_transcribed,
-        group_id=settings.kafka_group_id_bot,
+        topic=settings.topic_audio_uploaded,
+        group_id=settings.kafka_group_id_worker,
     )
