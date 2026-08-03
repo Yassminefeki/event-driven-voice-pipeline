@@ -18,7 +18,7 @@ Kafka Connect ES Sink) : il suppose qu'ils tournent déjà. Il a trois modes :
      pannes contrôlées (latence, timeouts, 500, 429), pour reproduire le
      bug "Whisper bloque sous forte charge" de façon reproductible.
      -> Pointer WHISPER_ENDPOINT du worker réel vers ce serveur avant de
-        lancer le test, puis (re)démarrer le worker.
+         lancer le test, puis (re)démarrer le worker.
 
   2) whisper-load : envoie une charge réelle CONCURRENTE directement vers
      l'endpoint Whisper réel, SANS passer par Kafka ni le worker. Isole la
@@ -86,8 +86,6 @@ def cmd_mock_whisper(args: argparse.Namespace) -> None:
             logger.info("mock-whisper: %s", fmt % a)
 
         def do_POST(self):
-            # Consomme le corps (le fichier audio envoyé par le worker),
-            # peu importe son contenu pour ce test de charge.
             length = int(self.headers.get("Content-Length", 0))
             _ = self.rfile.read(length)
 
@@ -101,7 +99,6 @@ def cmd_mock_whisper(args: argparse.Namespace) -> None:
                 if mode == "timeout":
                     logger.info("mock-whisper: simulate TIMEOUT (sleep %.1fs, no response)", slow_seconds)
                     time.sleep(slow_seconds)
-                    # Ne répond jamais -> le client requests finira par timeout lui-même
                     self.connection.close()
                     return
 
@@ -115,7 +112,6 @@ def cmd_mock_whisper(args: argparse.Namespace) -> None:
                     self.wfile.write(body)
                     return
 
-            # Cas nominal : réponse correcte, avec une petite latence réaliste
             time.sleep(random.uniform(0.05, 0.3))
             body = json.dumps({
                 "text": "ceci est une transcription simulée",
@@ -153,7 +149,6 @@ def _load_audio_bytes(args: argparse.Namespace) -> bytes:
         with open(args.audio_file, "rb") as f:
             return f.read()
 
-    # Pas de fichier fourni : tente de générer un court silence via ffmpeg.
     import subprocess
     import tempfile
     import os
@@ -186,13 +181,6 @@ def _load_audio_bytes(args: argparse.Namespace) -> bytes:
 # ---------------------------------------------------------------------------
 
 def cmd_whisper_load(args: argparse.Namespace) -> None:
-    """
-    Envoie N requêtes réelles en concurrence directe vers WHISPER_ENDPOINT,
-    sans passer par Kafka/le worker. Isole la capacité réelle de concurrence
-    du pod Whisper, indépendamment des goulots du pipeline (partitions,
-    worker mono-thread). Sert à calibrer ASR_WORKER_CONCURRENCY avant de
-    lancer le mode `run` end-to-end.
-    """
     import requests
     from config.settings import settings
 
@@ -316,7 +304,6 @@ class RunStats:
 
 
 def _producer_worker(audio_b64: str, rate: float, count: int, stats: RunStats) -> None:
-    """Publie `count` messages audio.uploaded à un débit cible de `rate` msg/s."""
     from services.kafka_service import kafka_service
 
     interval = 1.0 / rate if rate > 0 else 0.0
@@ -337,8 +324,6 @@ def _producer_worker(audio_b64: str, rate: float, count: int, stats: RunStats) -
         )
         return message_id
 
-    # Publication en léger parallélisme pour tenir le débit cible sans que
-    # la latence du broker ne ralentisse artificiellement l'injection.
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = []
         start = time.monotonic()
@@ -356,11 +341,6 @@ def _producer_worker(audio_b64: str, rate: float, count: int, stats: RunStats) -
 
 
 def _transcribed_consumer(stats: RunStats, stop_event: threading.Event) -> None:
-    """
-    Consomme audio.transcribed et simule immédiatement l'action "Valider"
-    de l'utilisateur (comme le ferait le bot Telegram), afin que le message
-    poursuive sa route jusqu'à transcription.corrected -> Elasticsearch.
-    """
     from services.kafka_service import kafka_service
 
     consumer = kafka_service.make_consumer(
@@ -368,7 +348,7 @@ def _transcribed_consumer(stats: RunStats, stop_event: threading.Event) -> None:
         group_id="stresstest-transcribed",
         enable_auto_commit=True,
         auto_offset_reset="latest" if STRESSTEST_START_FROM_LATEST else "earliest",
-        )
+    )
 
     for record in consumer:
         if stop_event.is_set():
@@ -380,7 +360,6 @@ def _transcribed_consumer(stats: RunStats, stop_event: threading.Event) -> None:
         with stats.lock:
             stats.transcribed_at[message_id] = time.monotonic()
 
-        # Auto-validation (équivalent du clic "✅ Valider" côté bot)
         kafka_service.publish_transcription_corrected(
             message_id=message_id,
             chat_id=event["chat_id"],
@@ -396,13 +375,13 @@ def _transcribed_consumer(stats: RunStats, stop_event: threading.Event) -> None:
 
 
 def _dlq_consumer(stats: RunStats, stop_event: threading.Event) -> None:
-    """Consomme audio.uploaded.dlq pour comptabiliser les échecs définitifs."""
     from services.kafka_service import kafka_service, TOPIC_AUDIO_UPLOADED_DLQ
 
     consumer = kafka_service.make_consumer(
         TOPIC_AUDIO_UPLOADED_DLQ,
         group_id=f"stresstest-dlq-{uuid.uuid4()}",
         enable_auto_commit=True,
+        auto_offset_reset="latest" if STRESSTEST_START_FROM_LATEST else "earliest",
     )
 
     for record in consumer:
@@ -421,7 +400,6 @@ def _dlq_consumer(stats: RunStats, stop_event: threading.Event) -> None:
 
 
 def _verify_elasticsearch(stats: RunStats, expected_ids: list, timeout_seconds: float) -> None:
-    """Interroge Elasticsearch jusqu'à ce que chaque message soit trouvé ou que le timeout expire."""
     from services.elastic_service import elastic_service
     from config.settings import settings
 
@@ -488,7 +466,6 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     stop_event.set()
 
-    # --- Rapport ---
     sent_ids = set(stats.sent_at.keys())
     indexed_ids = stats.indexed_ids
     dlq_ids = stats.dlq_ids & sent_ids
