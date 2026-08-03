@@ -430,11 +430,32 @@ def _verify_elasticsearch(stats: RunStats, expected_ids: list, timeout_seconds: 
 
         for message_id in list(remaining):
             try:
-                elastic_service._client.get(index=settings.elastic_index, id=message_id)
-                found_this_round.add(message_id)
-            except Exception:
-                pass  # pas encore indexé
+                resp = elastic_service._client.search(
+                index=settings.elastic_index,
+                query={
+                    "term": {
+                    "message_id.keyword": message_id
+                    }
+                },
+                size=1,
+                   )
 
+                total = resp["hits"]["total"]["value"]
+
+                if total > 0:
+                    found_this_round.add(message_id)
+
+            except Exception as e:
+                logger.error(
+            "Erreur lors de la recherche ES pour %s : %s",
+            message_id,
+            e,
+            )
+        logger.info(
+            "Elasticsearch : %d document(s) trouvés sur %d restant(s)",
+            len(found_this_round),
+            len(remaining),
+            )
         if found_this_round:
             with stats.lock:
                 stats.indexed_ids |= found_this_round
