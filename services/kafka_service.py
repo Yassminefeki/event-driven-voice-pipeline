@@ -211,6 +211,7 @@ class KafkaService:
         topic: str,
         group_id: str,
         enable_auto_commit: bool = False,
+        auto_offset_reset: str = "earliest",
     ) -> KafkaConsumer:
         """
         enable_auto_commit=False par défaut : l'appelant DOIT committer
@@ -228,7 +229,7 @@ class KafkaService:
             group_id=group_id,
             key_deserializer=lambda k: k.decode("utf-8") if k else None,
             value_deserializer=lambda v: json.loads(v.decode("utf-8")),
-            auto_offset_reset="earliest",
+            auto_offset_reset=auto_offset_reset,
             enable_auto_commit=enable_auto_commit,
             max_poll_interval_ms=600000,  # marge de sécurité si Whisper est lent sous charge
         )
