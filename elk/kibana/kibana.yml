@@ -1,0 +1,9 @@
+server.name: databot-kibana
+server.host: "0.0.0.0"
+server.port: 5601
+
+elasticsearch.hosts: ["http://elasticsearch:9200"]
+
+# Data View a creer manuellement (ou via API saved_objects) :
+#   Pattern : transcription.corrected*
+#   Champ temporel : timestamp

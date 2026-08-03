@@ -1,0 +1,32 @@
+{
+  "name": "es-transcription-corrected-sink",
+  "_comment_version": "Utiliser le connecteur kafka-connect-elasticsearch v15.1.0 ou superieur (client REST bas niveau). La v14 provoque un NullPointerException en bulk indexation avec Elasticsearch 8.15.0 (voir incident historique 6.10).",
+  "config": {
+    "connector.class": "io.confluent.connect.elasticsearch.ElasticsearchSinkConnector",
+    "tasks.max": "1",
+    "topics": "transcription.corrected",
+
+    "connection.url": "http://10.110.188.120:9200",
+
+    "type.name": "_doc",
+    "key.ignore": "false",
+    "schema.ignore": "true",
+
+    "behavior.on.null.values": "delete",
+    "behavior.on.malformed.documents": "warn",
+
+    "write.method": "upsert",
+
+    "_comment_key_id": "message_id est utilise comme _id du document ES pour garantir l'idempotence (upsert), voir etape 15 de la doc",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "false",
+
+    "errors.tolerance": "all",
+    "errors.deadletterqueue.topic.name": "transcription.corrected.dlq",
+    "errors.deadletterqueue.topic.replication.factor": "3",
+    "errors.deadletterqueue.context.headers.enable": "true"
+  }
+}

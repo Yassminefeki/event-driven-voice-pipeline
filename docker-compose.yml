@@ -1,14 +1,50 @@
-services:
-  telegram-bot:
-    build: .
-    command: ["python3", "main.py"]
-    env_file: .env
-    restart: unless-stopped
+version: "3.8"
 
-  whisper-worker:
-    build: .
+# Lance UNIQUEMENT les 3 services applicatifs (bot, asr-worker, s3-publisher).
+# Kafka (kafka1/kafka2/kafka3), Kafka Connect et la stack ELK/MinIO tournent
+# déjà sur leurs VM dédiées et ne sont pas gérés ici.
+#
+# Une seule commande pour tout démarrer :
+#   docker compose up -d --build
+#
+# Une seule commande pour tout arrêter :
+#   docker compose down
+
+x-app-common: &app-common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  env_file: .env
+  restart: unless-stopped
+  # Résolution des hostnames Kafka/MinIO/ES si tes VM ne sont pas déjà
+  # résolubles par le DNS du réseau Docker. Adapte les IP à ton infra réelle.
+  extra_hosts:
+    - "kafka1:10.110.188.121"
+    - "kafka2:10.110.188.122"
+    - "kafka3:10.110.188.123"
+    - "kafkaconnect:10.110.188.124"
+    - "elkminio:10.110.188.120"
+
+services:
+  bot:
+    <<: *app-common
+    container_name: databot-bot
+    # main.py fait des imports absolus (from bot.consumers...),
+    # donc on lance en tant que module depuis la racine /app.
+    command: ["python3", "-m", "bot.main"]
+
+  asr-worker:
+    <<: *app-common
+    container_name: databot-asr-worker
+    # whisper_worker.py importe dlq_handler/offset_manager en relatif,
+    # donc on doit se placer dans son dossier avant de le lancer.
+    working_dir: /app/asr-worker
     command: ["python3", "whisper_worker.py"]
-    env_file: .env
-    restart: unless-stopped
     deploy:
-      replicas: 2   # scale with: docker compose up -d --scale whisper-worker=N
+      replicas: 1   # scale avec: docker compose up -d --scale asr-worker=N
+
+  s3-publisher:
+    <<: *app-common
+    container_name: databot-s3-publisher
+    working_dir: /app/s3-publisher
+    command: ["python3", "s3_publisher_service.py"]

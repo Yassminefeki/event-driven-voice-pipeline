@@ -1,0 +1,13 @@
+cluster.name: databot-cluster
+node.name: elkminio-es-node1
+
+network.host: 0.0.0.0
+http.port: 9200
+
+discovery.type: single-node
+
+# Mono-noeud : pas de replicas (voir incident "Cluster ES Yellow" 6.11)
+index.number_of_replicas: 0
+
+# NOTE SECURITE : desactive pour simplifier le dev, a activer en production
+xpack.security.enabled: false

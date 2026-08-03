@@ -1,9 +1,29 @@
-.env
+# Python
 __pycache__/
-*.pyc
-.venv/
+*.py[cod]
+*.egg-info/
 venv/
-*.db
+.venv/
+
+# Env / secrets
+.env
+*.pem
+*.key
+
+# Logs
 *.log
+logs/
+
+# Data
+*.sqlite3
+data/
+
+# OS
 .DS_Store
-audio.*
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+*.pid
