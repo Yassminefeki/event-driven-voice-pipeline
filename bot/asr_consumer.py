@@ -13,7 +13,7 @@ from telegram import (
     InlineKeyboardMarkup,
     ForceReply,
 )
-from telegram.error import TelegramError
+from telegram.error import TelegramError, BadRequest
 
 from config.settings import settings
 from services.kafka_service import kafka_service
@@ -89,6 +89,17 @@ async def run_asr_consumer_loop(
                         parse_mode="HTML",
                         reply_markup=keyboard,
                     )
+
+                except BadRequest as e:
+                    # Cas spécifique du "Chat not found" ou ID invalide
+                    logger.error(
+                        "message_id=%s: échec définitif (Chat not found / BadRequest) "
+                        "pour chat_id=%s : %s. Message ignoré et offset commité.",
+                        message_id, chat_id, e
+                    )
+                    pending_transcriptions.pop(message_id, None)
+                    kafka_service.commit_offset(consumer, record)
+                    continue
 
                 except TelegramError:
                     # Une erreur Telegram sur CE message ne doit jamais

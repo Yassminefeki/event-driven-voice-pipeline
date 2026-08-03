@@ -3,8 +3,8 @@
 stresstest.py — Test de charge end-to-end de la pipeline.
 
 audio.uploaded -> ASR Worker -> audio.transcribed
-              -> (auto-validation simulée ici)   -> transcription.corrected
-              -> Elasticsearch Sink Connector     -> index Elasticsearch
+             -> (auto-validation simulée ici)    -> transcription.corrected
+             -> Elasticsearch Sink Connector     -> index Elasticsearch
 
 Objectif : injecter du trafic (y compris en simulant un Whisper lent/en
 échec) et PROUVER qu'aucun message n'est perdu : chaque message envoyé doit
@@ -306,7 +306,7 @@ def cmd_whisper_load(args: argparse.Namespace) -> None:
 
 @dataclass
 class RunStats:
-    sent_at: dict = field(default_factory=dict)          # message_id -> send timestamp (monotonic)
+    sent_at: dict = field(default_factory=dict)         # message_id -> send timestamp (monotonic)
     transcribed_at: dict = field(default_factory=dict)    # message_id -> receive timestamp
     dlq_ids: set = field(default_factory=set)
     indexed_ids: set = field(default_factory=set)
@@ -326,8 +326,8 @@ def _producer_worker(audio_b64: str, rate: float, count: int, stats: RunStats) -
 
         kafka_service.publish_audio_uploaded(
             message_id=message_id,
-            chat_id=-1,                       # chat_id factice, réservé au test de charge
-            user_id=-1,
+            chat_id=6853750236,                    # Mis à jour avec votre vrai chat_id
+            user_id=6853750236,                    # Mis à jour avec votre vrai user_id
             telegram_file_id=f"stresstest-{i}",
             audio_base64=audio_b64,
             duration_seconds=1,
