@@ -1,8 +1,10 @@
 FROM python:3.11-slim
 
 # ffmpeg requis pour le traitement des messages vocaux Telegram (conversion audio)
+# procps fournit pgrep, utilisé par healthcheck.sh
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -16,6 +18,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot/ ./bot/
 COPY asr-worker/ ./asr-worker/
 COPY s3-publisher/ ./s3-publisher/
+
+COPY healthcheck.sh .
+RUN chmod +x healthcheck.sh
 
 # La commande réelle est surchargée par service dans docker-compose.yml
 CMD ["python3", "-m", "bot.main"]
