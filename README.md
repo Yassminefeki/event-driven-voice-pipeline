@@ -10,13 +10,14 @@
 
 DataBot est un bot Telegram événementiel et **tolérant aux pannes** qui reçoit des messages vocaux, les fait transcrire par un service ASR (Whisper), permet à l'utilisateur de valider/corriger le texte, puis archive le résultat dans Elasticsearch pour recherche et visualisation dans Kibana.
 
-Dernière consolidation : **3 août 2026** — tests de résilience, optimisation ASR, intégration Dead-Letter Queue (DLQ).
+Dernière consolidation : **3 août 2026** — tests de résilience, optimisation ASR, intégration Dead-Letter Queue (DLQ), containerisation des services applicatifs avec healthcheck.
 
 ---
 
 ## 📑 Sommaire
 
 - [Architecture](#-architecture)
+- [Flux détaillé (Mermaid)](#-flux-détaillé-mermaid)
 - [Stack technique](#-stack-technique)
 - [Infrastructure](#-infrastructure)
 - [Structure du repo](#-structure-du-repo)
@@ -86,6 +87,102 @@ Dernière consolidation : **3 août 2026** — tests de résilience, optimisatio
 
 ---
 
+## 🧭 Flux détaillé (Mermaid)
+
+Le diagramme ci-dessous détaille le flux exact de l'application : composants, topics Kafka, groupes de consumers, et chemins d'échec (DLQ).
+
+```mermaid
+flowchart TD
+    U["👤 Utilisateur Telegram"]
+
+    subgraph BOT["🤖 Bot Telegram (container: databot-bot)"]
+        VH["voice_handler.py<br/>reçoit + encode Base64"]
+        VC["validation_handler.py<br/>clavier Valider/Corriger"]
+        TC["transcription_consumer.py<br/>consumer group: bot-consumer-group"]
+        ONS[("object_name_store.py<br/>SQLite: message_id → object_name")]
+    end
+
+    subgraph K["🗂️ Kafka (kafka1/kafka2/kafka3 — VM dédiées)"]
+        T1["Topic: audio.uploaded"]
+        T2["Topic: audio.stored"]
+        T3["Topic: audio.transcribed"]
+        T4["Topic: transcription.corrected"]
+        T5["Topic: audio.uploaded.dlq"]
+    end
+
+    subgraph CONNECT["🔌 Kafka Connect (VM kafkaconnect)"]
+        S3SINK["MinIO S3 Sink Connector"]
+        ESSINK["Elasticsearch Sink Connector v15.1.0+"]
+    end
+
+    subgraph ASR["🎧 ASR Worker (container: databot-asr-worker)"]
+        WW["whisper_worker.py<br/>consumer group: asr-worker-group<br/>ThreadPoolExecutor, concurrency=N"]
+        OM["offset_manager.py<br/>compute_safe_commit_offsets"]
+        DLQ["dlq_handler.py<br/>route_to_dlq"]
+    end
+
+    subgraph S3PUB["📤 S3 Publisher (container: databot-s3-publisher)"]
+        S3P["s3_publisher_service.py<br/>écoute événements bucket MinIO"]
+    end
+
+    subgraph STORAGE["🗄️ Stockage & Recherche (VM elkminio)"]
+        MINIO[("MinIO<br/>bucket: audio-archive")]
+        ES[("Elasticsearch<br/>index: transcription-corrected")]
+        KIB["Kibana Dashboards"]
+    end
+
+    WHISPER["🧠 API Whisper<br/>(service ASR externe)"]
+
+    %% Étapes 1-4 : upload
+    U -- "1. message vocal" --> VH
+    VH -- "2-3. publie JSON+Base64" --> T1
+
+    %% Étape 5 : archivage MinIO
+    T1 -- "5. consomme" --> S3SINK
+    S3SINK -- "écrit le binaire" --> MINIO
+
+    %% Étape 6 : confirmation de stockage
+    MINIO -- "notif objet écrit" --> S3P
+    S3P -- "6. publie confirmation" --> T2
+    T2 -- "alimente le cache" --> ONS
+
+    %% Étapes 7-10 : transcription
+    T1 -- "7. consomme (parallèle)" --> WW
+    WW -- "8. envoie audio" --> WHISPER
+    WHISPER -- "9. renvoie texte" --> WW
+    WW -- "calcule offset sûr" --> OM
+    WW -- "10a. succès" --> T3
+    WW -- "10b. échec irrécupérable" --> DLQ
+    DLQ -- "payload + en-tête erreur" --> T5
+
+    %% Étape 11 : livraison à l'utilisateur
+    T3 -- "11. consomme" --> TC
+    TC -- "résout audio_url" --> ONS
+    TC --> VC
+    VC -- "clavier interactif" --> U
+
+    %% Étapes 12-13 : validation/correction
+    U -- "12. valide ou corrige" --> VC
+    VC -- "13. publie + métriques WER/CER" --> T4
+
+    %% Étapes 14-16 : indexation & visualisation
+    T4 -- "14. consomme" --> ESSINK
+    ESSINK -- "15. indexe (_id=message_id)" --> ES
+    ES -- "16. Data View" --> KIB
+
+    classDef topic fill:#2d2d2d,stroke:#f5a623,color:#fff;
+    classDef dlq fill:#5c1a1a,stroke:#e74c3c,color:#fff;
+    class T1,T2,T3,T4 topic;
+    class T5 dlq;
+```
+
+**Légende rapide :**
+- 🟠 Les topics Kafka standards sont en orange.
+- 🔴 Le topic DLQ (`audio.uploaded.dlq`) est en rouge : c'est le chemin d'échec irrécupérable, jamais un cul-de-sac silencieux — il reste inspectable/rejouable (voir [Résilience & DLQ](#-résilience--dlq)).
+- Les 3 containers applicatifs (`databot-bot`, `databot-asr-worker`, `databot-s3-publisher`) sont les seuls composants lancés en local via `docker compose` ; Kafka, Kafka Connect et la stack ELK/MinIO tournent sur des VM dédiées déjà provisionnées.
+
+---
+
 ## 🧰 Stack technique
 
 | Technologie | Rôle | Détails |
@@ -98,6 +195,7 @@ Dernière consolidation : **3 août 2026** — tests de résilience, optimisatio
 | Whisper API | Moteur ASR | `http://10.110.150.77/v1/audio/transcriptions` |
 | Python 3.x | Bot & workers | `kafka-python`, `python-telegram-bot`, `requests`, `ThreadPoolExecutor` |
 | SQLite | `object_name_store` | Table `message_objects` (`message_id` → `object_name`) |
+| Docker / docker-compose | Containerisation des 3 services applicatifs | Healthcheck process + connectivité Kafka |
 | stresstest.py | Tests de charge & qualité | Simulation d'injection, mock d'erreurs ASR, mesure de débit |
 
 ---
@@ -111,7 +209,7 @@ Dernière consolidation : **3 août 2026** — tests de résilience, optimisatio
 | `kafka3` | 10.110.188.123 | Broker Kafka 3 + Controller KRaft | Kafka |
 | `kafkaconnect` | 10.110.188.124 | Nœud Kafka Connect principal | Connect Distributed (S3 & ES Sinks) |
 | `elkminio` | 10.110.188.120 | Stockage & recherche | Docker (MinIO, Elasticsearch, Kibana) |
-| `bot` | 10.110.188.125 | Application | Bot Telegram, ASR Worker, StressTest |
+| `bot` | 10.110.188.125 | Application | Bot Telegram, ASR Worker, S3 Publisher (containers Docker) |
 
 ### Services & ports
 
@@ -139,7 +237,10 @@ databot/
 ├── LICENSE
 ├── .gitignore
 ├── .env.example                  # Variables d'env sans valeurs sensibles
-├── docker-compose.yml            # MinIO + Elasticsearch + Kibana (stack elkminio)
+├── Dockerfile                    # Image partagée bot / asr-worker / s3-publisher
+├── docker-compose.yml            # Lance les 3 services applicatifs (Kafka/ELK sont sur des VM dédiées)
+├── healthcheck.sh                # Healthcheck générique (process + connectivité Kafka)
+├── requirements.txt              # Requirements fusionnés pour l'image applicative
 │
 ├── bot/                           # Application Telegram Bot
 │   ├── main.py                    # Point d'entrée du bot
@@ -161,7 +262,8 @@ databot/
 │   └── requirements.txt
 │
 ├── s3-publisher/                  # Service de confirmation MinIO
-│   └── s3_publisher_service.py    # Étape 6 : publie audio.stored
+│   ├── s3_publisher_service.py    # Étape 6 : publie audio.stored
+│   └── requirements.txt
 │
 ├── kafka/
 │   ├── kraft/                     # Configs des 3 brokers KRaft
@@ -213,32 +315,32 @@ cd databot
 cp .env.example .env        # renseigner les IP/ports/credentials réels
 ```
 
-### 1. Démarrer l'infrastructure ELK/MinIO
+> ℹ️ Kafka (kafka1/kafka2/kafka3), Kafka Connect et la stack ELK/MinIO tournent déjà sur des VM dédiées et provisionnées séparément (voir [Infrastructure](#-infrastructure)). Cette section couvre uniquement le démarrage des **3 services applicatifs** (bot, asr-worker, s3-publisher).
+
+### 1. Vérifier que l'infrastructure externe est disponible
+
+Avant de lancer l'application, confirme que ces briques répondent déjà :
 
 ```bash
-docker compose up -d
+# Kafka (depuis n'importe quel broker)
+kafka-topics.sh --bootstrap-server kafka1:9092 --list
+
+# MinIO
+curl -f http://10.110.188.120:9000/minio/health/live
+
+# Elasticsearch
+curl -f http://10.110.188.120:9200/_cluster/health
 ```
 
-### 2. Démarrer le cluster Kafka (KRaft)
-
-À exécuter sur `kafka1`, `kafka2`, `kafka3` :
-
-```bash
-kafka-storage.sh format -t <cluster-uuid> -c kafka/kraft/kafka1.properties
-kafka-server-start.sh kafka/kraft/kafka1.properties
-```
-
-### 3. Créer les topics
+Si les topics n'existent pas encore, les créer une seule fois :
 
 ```bash
 bash kafka/topics/create-topics.sh
 ```
 
-### 4. Démarrer Kafka Connect + déployer les connecteurs
+Et si les connecteurs Kafka Connect (S3 Sink / ES Sink) ne sont pas encore déployés :
 
 ```bash
-connect-distributed.sh kafka/connect/connect-distributed.properties &
-
 curl -X POST -H "Content-Type: application/json" \
   --data @kafka/connect/minio-s3-sink.json \
   http://10.110.188.124:8083/connectors
@@ -248,17 +350,50 @@ curl -X POST -H "Content-Type: application/json" \
   http://10.110.188.124:8083/connectors
 ```
 
-### 5. Lancer les services applicatifs
+### 2. Lancer les 3 services applicatifs (bot, asr-worker, s3-publisher)
+
+Une seule commande, depuis la racine du repo :
 
 ```bash
-# ASR Worker
-cd asr-worker && pip install -r requirements.txt && python3 whisper_worker.py
+docker compose up -d --build
+```
 
-# S3 Publisher
-cd s3-publisher && python3 s3_publisher_service.py
+Ça construit une image unique (`Dockerfile`) et démarre 3 containers :
 
-# Bot Telegram
-cd bot && pip install -r requirements.txt && python3 main.py
+| Container | Commande exécutée | Rôle |
+|---|---|---|
+| `databot-bot` | `python3 -m bot.main` | Bot Telegram (réception, validation, correction) |
+| `databot-asr-worker` | `python3 whisper_worker.py` | Transcription via Whisper + DLQ |
+| `databot-s3-publisher` | `python3 s3_publisher_service.py` | Confirmation des écritures MinIO |
+
+### 3. Vérifier que tout tourne (healthcheck inclus)
+
+```bash
+docker compose ps
+```
+
+La colonne `STATUS` doit passer à `healthy` pour les 3 containers après ~15-30s (délai de `start_period`). Chaque container est vérifié automatiquement toutes les 30s : process applicatif vivant + au moins un broker Kafka joignable (voir `healthcheck.sh`).
+
+Pour suivre les logs en direct :
+
+```bash
+docker compose logs -f bot
+docker compose logs -f asr-worker
+docker compose logs -f s3-publisher
+```
+
+### 4. Arrêter / relancer l'application
+
+```bash
+docker compose down          # arrête et supprime les 3 containers
+docker compose up -d --build # relance (rebuild si le code a changé)
+docker compose restart asr-worker   # relance un seul service
+```
+
+### 5. Scaler l'ASR Worker (optionnel)
+
+```bash
+docker compose up -d --scale asr-worker=3
 ```
 
 ---
@@ -353,6 +488,7 @@ Détails complets : [`docs/incidents.md`](docs/incidents.md)
 - [ ] Politique de rétention des logs (3 jours max, `MaxBackupIndex=3`) dans `log4j.properties` sur tous les brokers.
 - [ ] Exécuter `stresstest.py run` en pré-production avant chaque mise en prod.
 - [ ] Activer la sécurité (TLS/SASL Kafka, x-pack Elasticsearch) avant tout déploiement exposé.
+- [ ] Remplacer le healthcheck "process + connectivité Kafka" par un heartbeat applicatif (fraîcheur du dernier poll traité avec succès).
 
 ---
 
